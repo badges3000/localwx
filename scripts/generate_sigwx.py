@@ -78,7 +78,7 @@ def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib")
 def classify_ww_code(ww_val):
     val = int(round(ww_val)) if not np.isnan(ww_val) else 0
     if val in [0, 1, 2, 3]: return 'transparent'
-    elif val in [45, 48]: return 'fog'
+    elif val in [40, 41, 42, 43, 44, 45, 46, 47, 48]: return 'fog'
     elif val == 49: return 'fog_frost'
     elif val in [50, 51, 52, 53, 58, 60, 61, 80]: return 'rain_light'
     elif val in [54, 55, 62, 63, 81]: return 'rain_medium'
@@ -94,19 +94,33 @@ def classify_ww_code(ww_val):
     elif val in [96, 97, 98, 99]: return 'thunder_heavy'
     return 'transparent'
 
-def render_grib_to_png(grib_path, output_png_path, target_size=(640, 640)):
-    if not os.path.exists(grib_path): return False
+def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
+    if not os.path.exists(grib_path): return None
     try:
         with open(grib_path, 'rb') as f:
             gid = eccodes.codes_grib_new_from_file(f)
-            if gid is None: return False
+            if gid is None: return None
             Ni = eccodes.codes_get(gid, 'Ni')
             Nj = eccodes.codes_get(gid, 'Nj')
+
+            try:
+                lat_first = eccodes.codes_get_double(gid, 'latitudeOfFirstGridPointInDegrees')
+                lon_first = eccodes.codes_get_double(gid, 'longitudeOfFirstGridPointInDegrees')
+                lat_last = eccodes.codes_get_double(gid, 'latitudeOfLastGridPointInDegrees')
+                lon_last = eccodes.codes_get_double(gid, 'longitudeOfLastGridPointInDegrees')
+            except Exception:
+                lat_first = eccodes.codes_get(gid, 'latitudeOfFirstGridPoint') / 1e6
+                lon_first = eccodes.codes_get(gid, 'longitudeOfFirstGridPoint') / 1e6
+                lat_last = eccodes.codes_get(gid, 'latitudeOfLastGridPoint') / 1e6
+                lon_last = eccodes.codes_get(gid, 'longitudeOfLastGridPoint') / 1e6
+
+            j_scans_pos = eccodes.codes_get(gid, 'jScansPositively')
             values = eccodes.codes_get_values(gid)
             eccodes.codes_release(gid)
 
             grid_2d = values.reshape((Nj, Ni))
             height, width = grid_2d.shape
+
             img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
             pixels = img.load()
 
@@ -117,21 +131,27 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(640, 640)):
                     if color_key != 'transparent':
                         pixels[x, y] = COLOR_MAP[color_key]
 
+            if j_scans_pos == 1:
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
             img_resized = img.resize(target_size, Image.NEAREST)
             img_resized.save(output_png_path, 'PNG', optimize=True)
-            return True
+
+            min_lat = min(lat_first, lat_last)
+            max_lat = max(lat_first, lat_last)
+            min_lon = min(lon_first, lon_last)
+            max_lon = max(lon_first, lon_last)
+            return [[min_lat, min_lon], [max_lat, max_lon]]
     except Exception as e:
         print(f"Fehler beim Rendern: {e}")
-        return False
+        return None
 
 def upload_files_to_ftp(output_dir):
     server = os.environ.get('FTP_SERVER')
     user = os.environ.get('FTP_USERNAME')
     password = os.environ.get('FTP_PASSWORD')
 
-    if not server or not user or not password:
-        print("\nℹ️ Keine FTP-Zugangsdaten in Umgebungsvariablen gefunden.")
-        return
+    if not server or not user or not password: return
 
     print(f"\n📡 Verbinde mit FTP-Server: {server} als {user}...")
     ftp = None
@@ -140,19 +160,11 @@ def upload_files_to_ftp(output_dir):
         ftp.connect(server, 21, timeout=30)
         ftp.login(user, password)
         ftp.prot_p()
-        print("🔒 Gesicherte FTPS (TLS) Verbindung hergestellt.")
-    except Exception as e:
-        print(f"⚠️ FTPS fehlgeschlagen ({e}), versuche Standard-FTP...")
-        try:
-            ftp = ftplib.FTP()
-            ftp.connect(server, 21, timeout=30)
-            ftp.login(user, password)
-            print("🔓 Standard-FTP Verbindung hergestellt.")
-        except Exception as e2:
-            print(f"❌ FTP-Login fehlgeschlagen: {e2}")
-            return
+    except Exception:
+        ftp = ftplib.FTP()
+        ftp.connect(server, 21, timeout=30)
+        ftp.login(user, password)
 
-    # Im Stammverzeichnis des FTP-Users direkt data/sigwx erstellen
     ftp.cwd('/')
     for folder in ["data", "sigwx"]:
         try:
@@ -161,14 +173,10 @@ def upload_files_to_ftp(output_dir):
             try:
                 ftp.mkd(folder)
                 ftp.cwd(folder)
-            except Exception as e:
-                print(f"Hinweis beim Ordnererstellen ({folder}): {e}")
-
-    print(f"📂 Zielordner auf Server bereit: {ftp.pwd()}")
+            except Exception: pass
 
     files = [f for f in os.listdir(output_dir) if f.endswith('.png') or f.endswith('.json')]
     print(f"\n📤 Starte Upload von {len(files)} Dateien...")
-
     uploaded_count = 0
     for filename in sorted(files):
         local_path = os.path.join(output_dir, filename)
@@ -179,7 +187,7 @@ def upload_files_to_ftp(output_dir):
                 print(f"   ↳ {uploaded_count}/{len(files)} Dateien hochgeladen ({filename})...")
 
     ftp.quit()
-    print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt direkt in data/sigwx/!")
+    print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt in data/sigwx/!")
 
 def main():
     print("🚀 Starte DWD ICON-D2 Generator & Uploader...")
@@ -191,20 +199,28 @@ def main():
         "model": "DWD ICON-D2",
         "model_run": f"{date_str}{hour_str}z",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "bounds": [[43.5, 2.0], [57.0, 18.0]],
+        "bounds": [[43.2, 1.8], [56.2, 17.2]],
         "frames": []
     }
 
     success_count = 0
+    detected_bounds = None
+
     for step in range(49):
         step_time = run_date + timedelta(hours=step)
         png_name = f"sigwx_{step:02d}.png"
         png_path = os.path.join(output_dir, png_name)
         grib_file = download_dwd_file(date_str, hour_str, step, var="ww")
-        if grib_file and render_grib_to_png(grib_file, png_path):
-            metadata["frames"].append({"step": step, "valid_time": step_time.isoformat(), "file": png_name})
-            success_count += 1
-            if os.path.exists(grib_file): os.remove(grib_file)
+        if grib_file:
+            bounds = render_grib_to_png(grib_file, png_path)
+            if bounds:
+                if detected_bounds is None:
+                    detected_bounds = bounds
+                    metadata["bounds"] = detected_bounds
+                    print(f"📍 Exakte Geodaten-Grenzen: {detected_bounds}")
+                metadata["frames"].append({"step": step, "valid_time": step_time.isoformat(), "file": png_name})
+                success_count += 1
+                if os.path.exists(grib_file): os.remove(grib_file)
 
     with open(os.path.join(output_dir, "meta.json"), 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
