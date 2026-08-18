@@ -46,7 +46,7 @@ jobs:
           set ftp:ssl-allow yes
           set ftp:ssl-protect-data yes
           set ftp:passive-mode true
-          mkdir -p /httpdocs/data/sigwx
-          mirror -R --delete-first dist/sigwx/ /httpdocs/data/sigwx/
+          mkdir -p /httpdocs/localwx/data/sigwx
+          mirror -R --delete-first dist/sigwx/ /httpdocs/localwx/data/sigwx/
           quit
           EOF
