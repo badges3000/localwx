@@ -28,16 +28,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install Python Dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install eccodes numpy pillow
 
       - name: Run DWD SigWx Generator
         run: |
           mkdir -p dist/sigwx
-          python scripts/generate_sigwx.py
+          if [ -f "scripts/generate_sigwx.py" ]; then
+            python scripts/generate_sigwx.py
+          elif [ -f "generate_sigwx.py" ]; then
+            python generate_sigwx.py
+          else
+            echo "Fehler: generate_sigwx.py nicht gefunden!" && exit 1
+          fi
 
       - name: Upload SigWx Overlays to netcup Webhosting via FTPS
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
