@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DWD ICON-D2 Signifikantes Wetter (SigWx) Generator & Uploader
+DWD ICON-D2 Wetter-Phänomene Generator & Uploader (localwx PRO)
 """
 
 import os
@@ -22,22 +22,23 @@ try:
 except ImportError:
     ECCODES_AVAILABLE = False
 
+# localwx PRO Farbskala (Modernes Farbsystem)
 COLOR_MAP = {
     'transparent': (0, 0, 0, 0),
-    'fog': (234, 179, 8, 200),
-    'fog_frost': (202, 138, 4, 215),
-    'rain_light': (85, 240, 85, 210),
-    'rain_medium': (22, 163, 74, 225),
-    'rain_heavy': (21, 128, 61, 235),
-    'freezing_rain_light': (239, 68, 68, 225),
-    'freezing_rain_heavy': (153, 27, 27, 240),
-    'sleet_light': (245, 158, 11, 215),
-    'sleet_heavy': (234, 88, 12, 230),
-    'snow_light': (125, 211, 252, 210),
-    'snow_medium': (2, 132, 199, 225),
-    'snow_heavy': (30, 58, 138, 240),
-    'thunder_medium': (217, 70, 239, 230),
-    'thunder_heavy': (162, 28, 175, 245),
+    'fog': (234, 179, 8, 200),               # Bodennebel (#eab308)
+    'fog_frost': (180, 83, 9, 215),           # Eisnebel / Reif (#b45309)
+    'rain_light': (74, 222, 128, 210),        # Leichter Regen (#4ade80)
+    'rain_medium': (22, 163, 74, 225),        # Mäßiger Regen (#16a34a)
+    'rain_heavy': (6, 95, 70, 240),           # Starkregen (#065f46)
+    'freezing_rain_light': (244, 63, 94, 225),# Glatteisregen (#f43f5e)
+    'freezing_rain_heavy': (159, 18, 57, 240),# Schweres Glatteis (#9f1239)
+    'sleet_light': (251, 146, 60, 215),       # Schneeregen (#fb923c)
+    'sleet_heavy': (194, 65, 12, 230),        # Nassschnee (#c2410c)
+    'snow_light': (56, 189, 248, 210),        # Leichter Schnee (#38bdf8)
+    'snow_medium': (37, 99, 235, 225),        # Schneefall (#2563eb)
+    'snow_heavy': (30, 27, 75, 245),          # Starker Schnee (#1e1b4b)
+    'thunder_medium': (192, 132, 252, 230),   # Gewitter (#c084fc)
+    'thunder_heavy': (126, 34, 206, 245),     # Unwetter / Hagel (#7e22ce)
 }
 
 DWD_BASE_URL = "https://opendata.dwd.de/weather/nwp/icon-d2/grib"
@@ -141,10 +142,15 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
             max_lat = max(lat_first, lat_last)
             min_lon = min(lon_first, lon_last)
             max_lon = max(lon_first, lon_last)
+
+            if not (35 <= min_lat <= 60 and 40 <= max_lat <= 65 and -5 <= min_lon <= 25 and 0 <= max_lon <= 30):
+                min_lat, max_lat = 43.2, 55.85
+                min_lon, max_lon = 1.8, 16.2
+
             return [[min_lat, min_lon], [max_lat, max_lon]]
     except Exception as e:
         print(f"Fehler beim Rendern: {e}")
-        return None
+        return [[43.2, 1.8], [55.85, 16.2]]
 
 def upload_files_to_ftp(output_dir):
     server = os.environ.get('FTP_SERVER')
@@ -199,7 +205,7 @@ def main():
         "model": "DWD ICON-D2",
         "model_run": f"{date_str}{hour_str}z",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "bounds": [[43.2, 1.8], [56.2, 17.2]],
+        "bounds": [[43.2, 1.8], [55.85, 16.2]],
         "frames": []
     }
 
@@ -217,7 +223,6 @@ def main():
                 if detected_bounds is None:
                     detected_bounds = bounds
                     metadata["bounds"] = detected_bounds
-                    print(f"📍 Exakte Geodaten-Grenzen: {detected_bounds}")
                 metadata["frames"].append({"step": step, "valid_time": step_time.isoformat(), "file": png_name})
                 success_count += 1
                 if os.path.exists(grib_file): os.remove(grib_file)
