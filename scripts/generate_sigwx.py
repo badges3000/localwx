@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+DWD ICON-D2 Signifikantes Wetter (SigWx) Generator & Uploader
+"""
+
 import os
 import sys
 import json
@@ -126,7 +130,7 @@ def upload_files_to_ftp(output_dir):
     password = os.environ.get('FTP_PASSWORD')
 
     if not server or not user or not password:
-        print("\nℹ️ Keine FTP-Zugangsdaten gefunden.")
+        print("\nℹ️ Keine FTP-Zugangsdaten in Umgebungsvariablen gefunden.")
         return
 
     print(f"\n📡 Verbinde mit FTP-Server: {server} als {user}...")
@@ -148,29 +152,19 @@ def upload_files_to_ftp(output_dir):
             print(f"❌ FTP-Login fehlgeschlagen: {e2}")
             return
 
-    possible_paths = [
-        "/httpdocs/localwx/data/sigwx",
-        "/httpdocs/data/sigwx",
-        "/localwx/data/sigwx",
-        "/data/sigwx"
-    ]
-
-    target_dir = None
-    for test_path in possible_paths:
+    # Im Stammverzeichnis des FTP-Users direkt data/sigwx erstellen
+    ftp.cwd('/')
+    for folder in ["data", "sigwx"]:
         try:
-            parts = [p for p in test_path.split('/') if p]
-            ftp.cwd('/')
-            for part in parts:
-                try:
-                    ftp.cwd(part)
-                except ftplib.error_perm:
-                    ftp.mkd(part)
-                    ftp.cwd(part)
-            target_dir = test_path
-            print(f"📂 Zielordner auf Server gewählt: {ftp.pwd()}")
-            break
-        except Exception:
-            continue
+            ftp.cwd(folder)
+        except ftplib.error_perm:
+            try:
+                ftp.mkd(folder)
+                ftp.cwd(folder)
+            except Exception as e:
+                print(f"Hinweis beim Ordnererstellen ({folder}): {e}")
+
+    print(f"📂 Zielordner auf Server bereit: {ftp.pwd()}")
 
     files = [f for f in os.listdir(output_dir) if f.endswith('.png') or f.endswith('.json')]
     print(f"\n📤 Starte Upload von {len(files)} Dateien...")
@@ -185,7 +179,7 @@ def upload_files_to_ftp(output_dir):
                 print(f"   ↳ {uploaded_count}/{len(files)} Dateien hochgeladen ({filename})...")
 
     ftp.quit()
-    print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt auf deinem Server!")
+    print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt direkt in data/sigwx/!")
 
 def main():
     print("🚀 Starte DWD ICON-D2 Generator & Uploader...")
