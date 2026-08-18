@@ -1,0 +1,51 @@
+name: DWD ICON-D2 SigWx Pipeline
+
+on:
+  schedule:
+    # Läuft nach den DWD Hauptmodellläufen (00z, 03z, 06z, 09z, 12z, 15z, 18z, 21z) um Minute 45
+    - cron: '45 1,4,7,10,13,16,19,22 * * *'
+  workflow_dispatch: # Ermöglicht manuelles Starten über den GitHub 'Run workflow' Button
+
+concurrency:
+  group: sigwx-pipeline
+  cancel-in-progress: true
+
+jobs:
+  generate-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (ecCodes for GRIB2)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev libeccodes-tools bzip2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install eccodes numpy pillow
+
+      - name: Run DWD SigWx Generator
+        run: |
+          mkdir -p dist/sigwx
+          python scripts/generate_sigwx.py
+
+      - name: Upload SigWx Overlays to netcup Webhosting via FTPS
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./dist/sigwx/
+          server-dir: /httpdocs/data/sigwx/
+          dangerous-clean-slate: false
