@@ -115,6 +115,21 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                 lat_last = eccodes.codes_get(gid, 'latitudeOfLastGridPoint') / 1e6
                 lon_last = eccodes.codes_get(gid, 'longitudeOfLastGridPoint') / 1e6
 
+            # Längengrade normalisieren (GRIB2 speichert negative Werte oft als 360 - lon, z.B. 356.06° -> -3.94°)
+            if lon_first > 180: lon_first -= 360
+            if lon_last > 180: lon_last -= 360
+
+            # Exakte Gültigkeits-Uhrzeit aus dem GRIB-Header lesen (WMO-Standard)
+            exact_valid_iso = None
+            try:
+                valid_date = str(eccodes.codes_get(gid, 'validityDate'))
+                valid_time_int = eccodes.codes_get(gid, 'validityTime')
+                valid_time_str = f"{valid_time_int:04d}"
+                valid_dt = datetime.strptime(f"{valid_date}{valid_time_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+                exact_valid_iso = valid_dt.isoformat()
+            except Exception:
+                pass
+
             j_scans_pos = eccodes.codes_get(gid, 'jScansPositively')
             values = eccodes.codes_get_values(gid)
             eccodes.codes_release(gid)
@@ -132,25 +147,27 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                     if color_key != 'transparent':
                         pixels[x, y] = COLOR_MAP[color_key]
 
+            # Falls der GRIB-Scan von Süd nach Nord läuft, Bild vertikal spiegeln
             if j_scans_pos == 1:
                 img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
             img_resized = img.resize(target_size, Image.NEAREST)
             img_resized.save(output_png_path, 'PNG', optimize=True)
 
-            min_lat = min(lat_first, lat_last)
-            max_lat = max(lat_first, lat_last)
-            min_lon = min(lon_first, lon_last)
-            max_lon = max(lon_first, lon_last)
+            min_lat = round(min(lat_first, lat_last), 2)
+            max_lat = round(max(lat_first, lat_last), 2)
+            min_lon = round(min(lon_first, lon_last), 2)
+            max_lon = round(max(lon_first, lon_last), 2)
 
-            if not (35 <= min_lat <= 60 and 40 <= max_lat <= 65 and -5 <= min_lon <= 25 and 0 <= max_lon <= 30):
-                min_lat, max_lat = 43.2, 55.85
-                min_lon, max_lon = 1.8, 16.2
+            # Plausibilitätsprüfung für den DWD ICON-D2 Regular Germany-Domain
+            if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
+                min_lat, max_lat = 43.18, 58.08
+                min_lon, max_lon = -3.94, 20.34
 
-            return [[min_lat, min_lon], [max_lat, max_lon]]
+            return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
     except Exception as e:
         print(f"Fehler beim Rendern: {e}")
-        return [[43.2, 1.8], [55.85, 16.2]]
+        return [[43.18, -3.94], [58.08, 20.34]], None
 
 def upload_files_to_ftp(output_dir):
     server = os.environ.get('FTP_SERVER')
@@ -205,7 +222,7 @@ def main():
         "model": "DWD ICON-D2",
         "model_run": f"{date_str}{hour_str}z",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "bounds": [[43.2, 1.8], [55.85, 16.2]],
+        "bounds": [[43.18, -3.94], [58.08, 20.34]],
         "frames": []
     }
 
@@ -218,12 +235,13 @@ def main():
         png_path = os.path.join(output_dir, png_name)
         grib_file = download_dwd_file(date_str, hour_str, step, var="ww")
         if grib_file:
-            bounds = render_grib_to_png(grib_file, png_path)
-            if bounds:
+            res = render_grib_to_png(grib_file, png_path)
+            if res:
+                bounds, exact_iso = res
                 if detected_bounds is None:
                     detected_bounds = bounds
                     metadata["bounds"] = detected_bounds
-                metadata["frames"].append({"step": step, "valid_time": step_time.isoformat(), "file": png_name})
+                metadata["frames"].append({"step": step, "valid_time": exact_iso or step_time.isoformat(), "file": png_name})
                 success_count += 1
                 if os.path.exists(grib_file): os.remove(grib_file)
 
