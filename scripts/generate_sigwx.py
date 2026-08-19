@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 """
-DWD ICON-D2 Wetter-Phänomene Generator & Uploader (localwx PRO)
-Paralleler High-Speed Multi-Thread Downloader & Renderer
+DWD ICON-D2 Multi-Parameter Modellkarten Generator & Uploader (localwx PRO)
+===========================================================================
+Ultra-schneller paralleler Downloader & Vektorisierter Renderer für DWD ICON-D2
+GRIB2-Vorhersagen mit automatischem FTPS-Upload zu netcup.
+
+Unterstützte Parameter:
+1. sigwx: 🌩️ Wetter-Phänomene (14 meteorologische Kategorien)
+2. wind:  🌬️ 48h Spitzen-Windböen (km/h)
+3. cape:  ⚡ Unwetter- & Gewitterpotenzial (J/kg)
+4. rain:  🌧️ Akkumulierte 48h Regensummen (mm / l/m²)
+5. snow:  ❄️ Neuschneemenge (cm)
 """
 
 import os
@@ -9,6 +18,7 @@ import sys
 import json
 import time
 import bz2
+import argparse
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -24,7 +34,13 @@ try:
 except ImportError:
     ECCODES_AVAILABLE = False
 
-COLOR_MAP = {
+
+# ==============================================================================
+# PARAMETER- & FARBSKALEN-DEFINITIONEN
+# ==============================================================================
+
+# 1. Wetter-Phänomene Farbskala (14 Klassen)
+SIGWX_COLOR_MAP = {
     'transparent': (0, 0, 0, 0),
     'fog': (234, 179, 8, 200),               # Bodennebel (#eab308)
     'fog_frost': (180, 83, 9, 215),           # Eisnebel / Reif (#b45309)
@@ -42,21 +58,71 @@ COLOR_MAP = {
     'thunder_heavy': (126, 34, 206, 245),     # Unwetter / Hagel (#7e22ce)
 }
 
+PARAM_CONFIGS = {
+    'sigwx': {
+        'dwd_var': 'ww',
+        'folder': 'sigwx',
+        'title': 'Wetter-Phänomene',
+        'unit': 'Kategorie',
+        'scale_type': 'sigwx'
+    },
+    'wind': {
+        'dwd_var': 'vmax_10m',
+        'folder': 'wind',
+        'title': 'Spitzen-Windböen',
+        'unit': 'km/h',
+        'scale_type': 'wind'
+    },
+    'cape': {
+        'dwd_var': 'cape_ml',
+        'folder': 'cape',
+        'title': 'Unwetter- & Gewitterpotenzial',
+        'unit': 'J/kg',
+        'scale_type': 'cape'
+    },
+    'rain': {
+        'dwd_var': 'tot_prec',
+        'folder': 'rain',
+        'title': 'Akkumulierte Regensummen',
+        'unit': 'mm',
+        'scale_type': 'rain'
+    },
+    'snow': {
+        'dwd_var': 'freshsnow_acc',
+        'folder': 'snow',
+        'title': 'Neuschneemenge',
+        'unit': 'cm',
+        'scale_type': 'snow'
+    }
+}
+
 DWD_BASE_URL = "https://opendata.dwd.de/weather/nwp/icon-d2/grib"
 
+
 def get_latest_model_run():
+    """
+    Ermittelt den neuesten verfügbaren ICON-D2 Modell-Lauf auf dem DWD Open Data Server.
+    """
     now = datetime.now(timezone.utc)
     check_time = now - timedelta(hours=1, minutes=45)
     run_hour = (check_time.hour // 3) * 3
     run_date = check_time.replace(hour=run_hour, minute=0, second=0, microsecond=0)
-    return run_date.strftime("%Y%m%d"), f"{run_hour:02d}", run_date
+    
+    date_str = run_date.strftime("%Y%m%d")
+    hour_str = f"{run_hour:02d}"
+    return date_str, hour_str, run_date
+
 
 def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib"):
+    """
+    Lädt eine einzelne DWD ICON-D2 GRIB2.bz2 Datei herunter und entpackt sie.
+    """
     os.makedirs(temp_dir, exist_ok=True)
     step_str = f"{step:03d}"
     file_name = f"icon-d2_germany_regular-lat-lon_single-level_{date_str}{hour_str}_{step_str}_2d_{var}.grib2"
     bz2_file_name = f"{file_name}.bz2"
     url = f"{DWD_BASE_URL}/{hour_str}/{var}/{bz2_file_name}"
+    
     bz2_path = os.path.join(temp_dir, bz2_file_name)
     grib_path = os.path.join(temp_dir, file_name)
 
@@ -64,7 +130,7 @@ def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib")
         return grib_path
 
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'localwx-SigWx-Generator/2.0'})
+        req = urllib.request.Request(url, headers={'User-Agent': 'localwx-MultiModel-Generator/2.0'})
         with urllib.request.urlopen(req, timeout=25) as response, open(bz2_path, 'wb') as out_file:
             out_file.write(response.read())
 
@@ -73,35 +139,217 @@ def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib")
 
         if os.path.exists(bz2_path):
             os.remove(bz2_path)
+
         return grib_path
     except Exception:
         return None
 
-def classify_ww_code(ww_val):
-    val = int(round(ww_val)) if not np.isnan(ww_val) else 0
-    if val in [0, 1, 2, 3]: return 'transparent'
-    elif val in [40, 41, 42, 43, 44, 45, 46, 47, 48]: return 'fog'
-    elif val == 49: return 'fog_frost'
-    elif val in [50, 51, 52, 53, 58, 60, 61, 80]: return 'rain_light'
-    elif val in [54, 55, 62, 63, 81]: return 'rain_medium'
-    elif val in [64, 65, 82]: return 'rain_heavy'
-    elif val in [56, 66]: return 'freezing_rain_light'
-    elif val in [57, 67]: return 'freezing_rain_heavy'
-    elif val in [68, 83]: return 'sleet_light'
-    elif val in [69, 84]: return 'sleet_heavy'
-    elif val in [70, 71, 77, 85]: return 'snow_light'
-    elif val in [72, 73]: return 'snow_medium'
-    elif val in [74, 75, 76, 86]: return 'snow_heavy'
-    elif val in [87, 88, 89, 90, 95]: return 'thunder_medium'
-    elif val in [96, 97, 98, 99]: return 'thunder_heavy'
-    return 'transparent'
 
-def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
-    if not os.path.exists(grib_path): return None
+# ==============================================================================
+# VEKTORISIERTE FARB-TRANSFORMATIONEN (NUMPY ACCELERATED)
+# ==============================================================================
+
+def colorize_sigwx(grid_2d):
+    """Färbt die diskreten DWD Wetterzustandscodes (0-99) ein."""
+    h, w = grid_2d.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # Erzeuge Lookup-Array für Codes 0 bis 100
+    lut = np.zeros((101, 4), dtype=np.uint8)
+    
+    for val in range(101):
+        if val in [40, 41, 42, 43, 44, 45, 46, 47, 48]:
+            lut[val] = SIGWX_COLOR_MAP['fog']
+        elif val == 49:
+            lut[val] = SIGWX_COLOR_MAP['fog_frost']
+        elif val in [50, 51, 52, 53, 58, 60, 61, 80]:
+            lut[val] = SIGWX_COLOR_MAP['rain_light']
+        elif val in [54, 55, 62, 63, 81]:
+            lut[val] = SIGWX_COLOR_MAP['rain_medium']
+        elif val in [64, 65, 82]:
+            lut[val] = SIGWX_COLOR_MAP['rain_heavy']
+        elif val in [56, 66]:
+            lut[val] = SIGWX_COLOR_MAP['freezing_rain_light']
+        elif val in [57, 67]:
+            lut[val] = SIGWX_COLOR_MAP['freezing_rain_heavy']
+        elif val in [68, 83]:
+            lut[val] = SIGWX_COLOR_MAP['sleet_light']
+        elif val in [69, 84]:
+            lut[val] = SIGWX_COLOR_MAP['sleet_heavy']
+        elif val in [70, 71, 77, 85]:
+            lut[val] = SIGWX_COLOR_MAP['snow_light']
+        elif val in [72, 73]:
+            lut[val] = SIGWX_COLOR_MAP['snow_medium']
+        elif val in [74, 75, 76, 86]:
+            lut[val] = SIGWX_COLOR_MAP['snow_heavy']
+        elif val in [87, 88, 89, 90, 95]:
+            lut[val] = SIGWX_COLOR_MAP['thunder_medium']
+        elif val in [96, 97, 98, 99]:
+            lut[val] = SIGWX_COLOR_MAP['thunder_heavy']
+
+    clipped = np.clip(np.nan_to_num(grid_2d, nan=0).astype(int), 0, 100)
+    return lut[clipped]
+
+
+def colorize_wind(grid_2d):
+    """
+    Spitzenwindböen: Umrechnung von m/s in km/h (* 3.6).
+    Schwellenwerte von 30 km/h bis > 120 km/h.
+    """
+    kmh = np.nan_to_num(grid_2d, nan=0) * 3.6
+    h, w = kmh.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # < 30 km/h = Transparent
+    # 30-45 km/h = Sanftes Türkisgrün
+    mask = (kmh >= 30) & (kmh < 45)
+    rgba[mask] = [52, 211, 153, 160]
+
+    # 45-60 km/h = Gelb (starker Wind / Bft 6-7)
+    mask = (kmh >= 45) & (kmh < 60)
+    rgba[mask] = [250, 204, 21, 200]
+
+    # 60-75 km/h = Orange (stürmische Böen / Bft 8)
+    mask = (kmh >= 60) & (kmh < 75)
+    rgba[mask] = [251, 146, 60, 220]
+
+    # 75-90 km/h = Kräftiges Rot (Sturmböen / Bft 9-10)
+    mask = (kmh >= 75) & (kmh < 90)
+    rgba[mask] = [239, 68, 68, 235]
+
+    # 90-105 km/h = Dunkelrot (schwere Sturmböen / Bft 10-11)
+    mask = (kmh >= 90) & (kmh < 105)
+    rgba[mask] = [185, 28, 28, 245]
+
+    # 105-120 km/h = Magenta / Violett (orkanartige Böen / Bft 11-12)
+    mask = (kmh >= 105) & (kmh < 120)
+    rgba[mask] = [192, 38, 211, 250]
+
+    # > 120 km/h = Pink/Weiß (Orkanböen / Bft 12+)
+    mask = (kmh >= 120)
+    rgba[mask] = [244, 114, 182, 255]
+
+    return rgba
+
+
+def colorize_cape(grid_2d):
+    """
+    Unwetter- & Gewitterenergie (CAPE in J/kg).
+    """
+    cape = np.nan_to_num(grid_2d, nan=0)
+    h, w = cape.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # 100 - 350 J/kg = Zartes Gelbgrün (geringe Labilität)
+    mask = (cape >= 100) & (cape < 350)
+    rgba[mask] = [163, 230, 53, 160]
+
+    # 350 - 800 J/kg = Gelb (mäßige Gewittergefahr)
+    mask = (cape >= 350) & (cape < 800)
+    rgba[mask] = [250, 204, 21, 200]
+
+    # 800 - 1500 J/kg = Warmes Orange (erhöhte Unwettergefahr / Starkregen)
+    mask = (cape >= 800) & (cape < 1500)
+    rgba[mask] = [249, 115, 22, 225]
+
+    # 1500 - 2500 J/kg = Kräftiges Rot (hohe Unwettergefahr / Hagel)
+    mask = (cape >= 1500) & (cape < 2500)
+    rgba[mask] = [220, 38, 38, 245]
+
+    # > 2500 J/kg = Magenta / Violett (Extremes Schwergewitter-Potenzial)
+    mask = (cape >= 2500)
+    rgba[mask] = [147, 51, 234, 255]
+
+    return rgba
+
+
+def colorize_rain(grid_2d):
+    """
+    Akkumulierte 48h Niederschlagssumme (mm / l/m²).
+    """
+    rain = np.nan_to_num(grid_2d, nan=0)
+    h, w = rain.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # 0.5 - 2 mm = Hauchzartes Hellblau
+    mask = (rain >= 0.5) & (rain < 2.0)
+    rgba[mask] = [186, 230, 253, 140]
+
+    # 2 - 10 mm = Türkisgrün
+    mask = (rain >= 2.0) & (rain < 10.0)
+    rgba[mask] = [52, 211, 153, 180]
+
+    # 10 - 20 mm = Saftiges Grün
+    mask = (rain >= 10.0) & (rain < 20.0)
+    rgba[mask] = [22, 163, 74, 210]
+
+    # 20 - 35 mm = Bernstein / Gelb
+    mask = (rain >= 20.0) & (rain < 35.0)
+    rgba[mask] = [234, 179, 8, 230]
+
+    # 35 - 50 mm = Orange
+    mask = (rain >= 35.0) & (rain < 50.0)
+    rgba[mask] = [234, 88, 12, 240]
+
+    # 50 - 75 mm = Kräftiges Rot (Dauerregen / Überflutung)
+    mask = (rain >= 50.0) & (rain < 75.0)
+    rgba[mask] = [220, 38, 38, 245]
+
+    # > 75 mm = Violett / Magenta (Extremer Starkregen)
+    mask = (rain >= 75.0)
+    rgba[mask] = [126, 34, 206, 255]
+
+    return rgba
+
+
+def colorize_snow(grid_2d):
+    """
+    Akkumulierter Neuschnee in cm.
+    """
+    snow = np.nan_to_num(grid_2d, nan=0) # in kg/m² (~cm bei Dichte 100)
+    h, w = snow.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # 0.5 - 2 cm = Zartes Cyan
+    mask = (snow >= 0.5) & (snow < 2.0)
+    rgba[mask] = [125, 211, 252, 170]
+
+    # 2 - 5 cm = Hellblau
+    mask = (snow >= 2.0) & (snow < 5.0)
+    rgba[mask] = [56, 189, 248, 200]
+
+    # 5 - 10 cm = Mittelblau
+    mask = (snow >= 5.0) & (snow < 10.0)
+    rgba[mask] = [37, 99, 235, 225]
+
+    # 10 - 20 cm = Kräftiges Royalblau
+    mask = (snow >= 10.0) & (snow < 20.0)
+    rgba[mask] = [29, 78, 216, 240]
+
+    # 20 - 35 cm = Dunkles Indigo
+    mask = (snow >= 20.0) & (snow < 35.0)
+    rgba[mask] = [30, 27, 75, 250]
+
+    # > 35 cm = Schneeviolett / Pink
+    mask = (snow >= 35.0)
+    rgba[mask] = [236, 72, 153, 255]
+
+    return rgba
+
+
+def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_size=(1024, 1024)):
+    """
+    Liest die GRIB2-Datei mit eccodes, wendet die Vektor-Colormap an und speichert das PNG.
+    """
+    if not os.path.exists(grib_path):
+        return None
+
     try:
         with open(grib_path, 'rb') as f:
             gid = eccodes.codes_grib_new_from_file(f)
-            if gid is None: return None
+            if gid is None:
+                return None
+
             Ni = eccodes.codes_get(gid, 'Ni')
             Nj = eccodes.codes_get(gid, 'Nj')
 
@@ -116,9 +364,11 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                 lat_last = eccodes.codes_get(gid, 'latitudeOfLastGridPoint') / 1e6
                 lon_last = eccodes.codes_get(gid, 'longitudeOfLastGridPoint') / 1e6
 
+            # Längengrade normalisieren (z.B. 356.06° -> -3.94°)
             if lon_first > 180: lon_first -= 360
             if lon_last > 180: lon_last -= 360
 
+            # Exakte Gültigkeits-Uhrzeit aus dem GRIB-Header lesen
             exact_valid_iso = None
             try:
                 valid_date = str(eccodes.codes_get(gid, 'validityDate'))
@@ -126,28 +376,34 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                 valid_time_str = f"{valid_time_int:04d}"
                 valid_dt = datetime.strptime(f"{valid_date}{valid_time_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
                 exact_valid_iso = valid_dt.isoformat()
-            except Exception: pass
+            except Exception:
+                pass
 
             j_scans_pos = eccodes.codes_get(gid, 'jScansPositively')
             values = eccodes.codes_get_values(gid)
             eccodes.codes_release(gid)
 
             grid_2d = values.reshape((Nj, Ni))
-            height, width = grid_2d.shape
 
-            img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-            pixels = img.load()
+            # Vektorisierte Farb-Transformation je nach Skalentyp
+            if scale_type == 'sigwx':
+                rgba_array = colorize_sigwx(grid_2d)
+            elif scale_type == 'wind':
+                rgba_array = colorize_wind(grid_2d)
+            elif scale_type == 'cape':
+                rgba_array = colorize_cape(grid_2d)
+            elif scale_type == 'rain':
+                rgba_array = colorize_rain(grid_2d)
+            elif scale_type == 'snow':
+                rgba_array = colorize_snow(grid_2d)
+            else:
+                rgba_array = colorize_sigwx(grid_2d)
 
-            for y in range(height):
-                for x in range(width):
-                    val = grid_2d[y, x]
-                    color_key = classify_ww_code(val)
-                    if color_key != 'transparent':
-                        pixels[x, y] = COLOR_MAP[color_key]
-
+            # Falls Scan von Süd nach Nord läuft, vertikal spiegeln
             if j_scans_pos == 1:
-                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+                rgba_array = np.flipud(rgba_array)
 
+            img = Image.fromarray(rgba_array, mode='RGBA')
             img_resized = img.resize(target_size, Image.NEAREST)
             img_resized.save(output_png_path, 'PNG', optimize=True)
 
@@ -156,39 +412,66 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
             min_lon = round(min(lon_first, lon_last), 2)
             max_lon = round(max(lon_first, lon_last), 2)
 
+            # Plausibilitätsprüfung für DWD ICON-D2 Regular Grid
             if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
                 min_lat, max_lat = 43.18, 58.08
                 min_lon, max_lon = -3.94, 20.34
 
             return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
+
     except Exception as e:
-        print(f"Fehler beim Rendern: {e}")
+        print(f"Fehler beim Rendern von {grib_path}: {e}")
         return [[43.18, -3.94], [58.08, 20.34]], None
 
-def process_single_step(step, date_str, hour_str, run_date, output_dir, temp_dir):
+
+def process_single_step(step, date_str, hour_str, run_date, param_key, output_dir, temp_dir):
+    """
+    Verarbeitet einen einzelnen Vorhersageschritt für einen bestimmten Parameter.
+    """
+    config = PARAM_CONFIGS[param_key]
+    dwd_var = config['dwd_var']
+    scale_type = config['scale_type']
+
     step_time = run_date + timedelta(hours=step)
-    png_name = f"sigwx_{step:02d}.png"
+    png_name = f"frame_{step:02d}.png"
+    # Für SigWx auch sigwx_XX.png als Alias unterstützen
+    if param_key == 'sigwx':
+        png_name = f"sigwx_{step:02d}.png"
+
     png_path = os.path.join(output_dir, png_name)
-    grib_file = download_dwd_file(date_str, hour_str, step, var="ww", temp_dir=temp_dir)
+
+    grib_file = download_dwd_file(date_str, hour_str, step, var=dwd_var, temp_dir=temp_dir)
     if not grib_file:
         return step, None, None, None
-    res = render_grib_to_png(grib_file, png_path)
+
+    res = render_grib_to_png(grib_file, png_path, scale_type=scale_type)
     if os.path.exists(grib_file):
-        try: os.remove(grib_file)
-        except Exception: pass
+        try:
+            os.remove(grib_file)
+        except Exception:
+            pass
+
     if res:
         bounds, exact_iso = res
-        return step, png_name, bounds, exact_iso or step_time.isoformat()
+        valid_iso = exact_iso or step_time.isoformat()
+        return step, png_name, bounds, valid_iso
     return step, None, None, None
 
-def upload_files_to_ftp(output_dir):
+
+def upload_directory_to_ftp(local_dir, remote_folder):
+    """
+    Lädt alle generierten Dateien per FTPS in das Verzeichnis data/{remote_folder}/ hoch.
+    """
     server = os.environ.get('FTP_SERVER')
     user = os.environ.get('FTP_USERNAME')
     password = os.environ.get('FTP_PASSWORD')
 
-    if not server or not user or not password: return
+    if not server or not user or not password:
+        print(f"ℹ️ Keine FTP-Zugangsdaten. Überspringe Upload für {remote_folder}.")
+        return
 
-    print(f"\n📡 Verbinde mit FTP-Server: {server} als {user}...")
+    print(f"\n📡 Verbinde mit FTP-Server für '{remote_folder}'...")
+
     ftp = None
     try:
         ftp = ftplib.FTP_TLS()
@@ -196,63 +479,78 @@ def upload_files_to_ftp(output_dir):
         ftp.login(user, password)
         ftp.prot_p()
     except Exception:
-        ftp = ftplib.FTP()
-        ftp.connect(server, 21, timeout=30)
-        ftp.login(user, password)
+        try:
+            ftp = ftplib.FTP()
+            ftp.connect(server, 21, timeout=30)
+            ftp.login(user, password)
+        except Exception as e:
+            print(f"❌ FTP-Verbindung fehlgeschlagen: {e}")
+            return
 
+    # Zielordner /data/{remote_folder} erstellen & wechseln
     ftp.cwd('/')
-    for folder in ["data", "sigwx"]:
+    for folder in ["data", remote_folder]:
         try:
             ftp.cwd(folder)
         except ftplib.error_perm:
             try:
                 ftp.mkd(folder)
                 ftp.cwd(folder)
-            except Exception: pass
+            except Exception as e:
+                print(f"Hinweis beim Ordnererstellen ({folder}): {e}")
 
-    files = [f for f in os.listdir(output_dir) if f.endswith('.png') or f.endswith('.json')]
-    print(f"\n📤 Starte Upload von {len(files)} Dateien...")
+    files = [f for f in os.listdir(local_dir) if f.endswith('.png') or f.endswith('.json')]
+    print(f"📤 Lade {len(files)} Dateien nach data/{remote_folder}/ hoch...")
+
     uploaded_count = 0
     for filename in sorted(files):
-        local_path = os.path.join(output_dir, filename)
+        local_path = os.path.join(local_dir, filename)
         with open(local_path, 'rb') as f_in:
             ftp.storbinary(f"STOR {filename}", f_in)
             uploaded_count += 1
-            if uploaded_count % 10 == 0 or uploaded_count == len(files):
-                print(f"   ↳ {uploaded_count}/{len(files)} Dateien hochgeladen ({filename})...")
 
     ftp.quit()
-    print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt in data/sigwx/!")
+    print(f"✅ {uploaded_count} Dateien erfolgreich nach data/{remote_folder}/ hochgeladen!")
 
-def main():
-    start_time = time.time()
-    print("🚀 Starte DWD ICON-D2 High-Speed Generator & Uploader...")
-    date_str, hour_str, run_date = get_latest_model_run()
-    output_dir = "./dist/sigwx"
-    temp_dir = "./tmp_grib"
+
+def process_parameter(param_key, date_str, hour_str, run_date, max_steps=48):
+    """
+    Verarbeitet alle 48 Zeitschritte eines Parameters parallel.
+    """
+    config = PARAM_CONFIGS[param_key]
+    folder = config['folder']
+    title = config['title']
+
+    print(f"\n=======================================================")
+    print(f"🔄 Starte Generierung für: {title} ({param_key})")
+    print(f"=======================================================")
+
+    output_dir = f"./dist/{folder}"
+    temp_dir = f"./tmp_{param_key}"
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
     metadata = {
         "model": "DWD ICON-D2",
+        "parameter": param_key,
+        "title": title,
+        "unit": config['unit'],
         "model_run": f"{date_str}{hour_str}z",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bounds": [[43.18, -3.94], [58.08, 20.34]],
         "frames": []
     }
 
-    max_steps = 48
     detected_bounds = None
     results = {}
 
-    print(f"⚡ Starte paralleles Multithreading für alle {max_steps+1} Stunden (6 Worker)...")
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
-            executor.submit(process_single_step, step, date_str, hour_str, run_date, output_dir, temp_dir): step
+            executor.submit(process_single_step, step, date_str, hour_str, run_date, param_key, output_dir, temp_dir): step
             for step in range(max_steps + 1)
         }
 
-        completed_count = 0
+        completed = 0
         for future in as_completed(futures):
             step = futures[future]
             try:
@@ -266,20 +564,52 @@ def main():
                     if bounds and detected_bounds is None:
                         detected_bounds = bounds
                         metadata["bounds"] = detected_bounds
-                completed_count += 1
-                if completed_count % 8 == 0 or completed_count == (max_steps + 1):
-                    print(f"   ↳ {completed_count}/{max_steps+1} Stunden verarbeitet...")
+                completed += 1
+                if completed % 12 == 0 or completed == (max_steps + 1):
+                    print(f"   ↳ [{param_key}] {completed}/{max_steps+1} Stunden fertig...")
             except Exception as e:
-                print(f"⚠️ Fehler bei Schritt {step}: {e}")
+                print(f"⚠️ Fehler bei [{param_key}] Schritt {step}: {e}")
 
+    # Frames sortieren & meta.json schreiben
     metadata["frames"] = [results[s] for s in sorted(results.keys())]
 
-    with open(os.path.join(output_dir, "meta.json"), 'w', encoding='utf-8') as f:
+    meta_path = os.path.join(output_dir, "meta.json")
+    with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
+    print(f"✨ Parameter '{param_key}' abgeschlossen ({len(metadata['frames'])} Frames).")
+
+    # Upload
+    upload_directory_to_ftp(output_dir, folder)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DWD ICON-D2 Multi-Model Map Generator")
+    parser.add_argument(
+        '--param',
+        choices=['all', 'sigwx', 'wind', 'cape', 'rain', 'snow'],
+        default='all',
+        help="Welcher Parameter generiert werden soll (Standard: all)"
+    )
+    args = parser.parse_args()
+
+    start_time = time.time()
+    print("🚀 Starte DWD ICON-D2 Multi-Parameter Generator (localwx PRO)...")
+
+    date_str, hour_str, run_date = get_latest_model_run()
+    print(f"📅 DWD Modell-Lauf: {date_str} {hour_str}:00 UTC")
+
+    if args.param == 'all':
+        active_params = ['sigwx', 'wind', 'cape', 'rain', 'snow']
+    else:
+        active_params = [args.param]
+
+    for p in active_params:
+        process_parameter(p, date_str, hour_str, run_date)
+
     duration = round(time.time() - start_time, 1)
-    print(f"\n✅ Fertig! {len(metadata['frames'])} Frames in nur {duration} Sekunden gerendert.")
-    upload_files_to_ftp(output_dir)
+    print(f"\n🎉 GESAMT-ERFOLG: Alle {len(active_params)} Modell-Karten in {duration} Sekunden verarbeitet!")
+
 
 if __name__ == "__main__":
     main()
