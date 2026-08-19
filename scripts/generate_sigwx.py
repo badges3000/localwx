@@ -62,8 +62,8 @@ PARAM_CONFIGS = {
     'sigwx': {
         'dwd_var': 'ww',
         'folder': 'sigwx',
-        'title': 'Wetter-Phänomene',
-        'unit': 'Kategorie',
+        'title': 'Signifikantes Wetter',
+        'unit': '14 Kategorien',
         'scale_type': 'sigwx'
     },
     'wind': {
@@ -416,9 +416,10 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
                 rgba_array = np.flipud(rgba_array)
 
             img = Image.fromarray(rgba_array, mode='RGBA')
-            img_resized = img.resize(target_size, Image.NEAREST)
-            # Speichere als hocheffizientes WebP mit Alpha-Transparenz
-            img_resized.save(output_png_path, 'WEBP', quality=88, method=4)
+            # 1400x1400 Auflösung für gestochen scharfe Details beim Hereinzoomen
+            img_resized = img.resize((1400, 1400), Image.NEAREST)
+            # 100% verlustfreies WebP (Zero Artifacts) mit Alpha-Transparenz
+            img_resized.save(output_png_path, 'WEBP', lossless=True, method=6)
 
             min_lat = round(min(lat_first, lat_last), 2)
             max_lat = round(max(lat_first, lat_last), 2)
