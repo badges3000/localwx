@@ -149,10 +149,20 @@ def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib")
 # VEKTORISIERTE FARB-TRANSFORMATIONEN (NUMPY ACCELERATED)
 # ==============================================================================
 
+def clean_grib_grid(grid_2d, max_valid=10000.0, min_valid=0.0):
+    """
+    Bereinigt das GRIB2-Gitter von DWD Missing-Values (z.B. 9999, 1e20), NaNs und Infs.
+    Punkte außerhalb des Modell-Gebiets werden transparent (0).
+    """
+    arr = np.nan_to_num(grid_2d, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.where((arr > max_valid) | (arr < min_valid), 0.0, arr)
+    return arr
+
+
 def colorize_sigwx(grid_2d):
     """Färbt die diskreten DWD Wetterzustandscodes (0-99) ein."""
-    h, w = grid_2d.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    clean_val = clean_grib_grid(grid_2d, max_valid=99.0, min_valid=0.0)
+    h, w = clean_val.shape
 
     # Erzeuge Lookup-Array für Codes 0 bis 100
     lut = np.zeros((101, 4), dtype=np.uint8)
@@ -187,7 +197,7 @@ def colorize_sigwx(grid_2d):
         elif val in [96, 97, 98, 99]:
             lut[val] = SIGWX_COLOR_MAP['thunder_heavy']
 
-    clipped = np.clip(np.nan_to_num(grid_2d, nan=0).astype(int), 0, 100)
+    clipped = np.clip(clean_val.astype(int), 0, 100)
     return lut[clipped]
 
 
@@ -196,7 +206,9 @@ def colorize_wind(grid_2d):
     Spitzenwindböen: Umrechnung von m/s in km/h (* 3.6).
     Schwellenwerte von 30 km/h bis > 120 km/h.
     """
-    kmh = np.nan_to_num(grid_2d, nan=0) * 3.6
+    # Filtere unphysikalische Werte und DWD Missing-Values (9999, 1e20) heraus
+    clean_ms = clean_grib_grid(grid_2d, max_valid=120.0, min_valid=0.0) # max 120 m/s = 432 km/h
+    kmh = clean_ms * 3.6
     h, w = kmh.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
@@ -225,8 +237,8 @@ def colorize_wind(grid_2d):
     mask = (kmh >= 105) & (kmh < 120)
     rgba[mask] = [192, 38, 211, 250]
 
-    # > 120 km/h = Pink/Weiß (Orkanböen / Bft 12+)
-    mask = (kmh >= 120)
+    # > 120 km/h = Pink/Weiß (Orkanböen / Bft 12+) mit Obergrenze
+    mask = (kmh >= 120) & (kmh <= 450)
     rgba[mask] = [244, 114, 182, 255]
 
     return rgba
@@ -236,7 +248,7 @@ def colorize_cape(grid_2d):
     """
     Unwetter- & Gewitterenergie (CAPE in J/kg).
     """
-    cape = np.nan_to_num(grid_2d, nan=0)
+    cape = clean_grib_grid(grid_2d, max_valid=8000.0, min_valid=0.0)
     h, w = cape.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
@@ -256,8 +268,8 @@ def colorize_cape(grid_2d):
     mask = (cape >= 1500) & (cape < 2500)
     rgba[mask] = [220, 38, 38, 245]
 
-    # > 2500 J/kg = Magenta / Violett (Extremes Schwergewitter-Potenzial)
-    mask = (cape >= 2500)
+    # > 2500 J/kg = Magenta / Violett (Extremes Schwergewitter-Potenzial) mit Obergrenze
+    mask = (cape >= 2500) & (cape <= 8000)
     rgba[mask] = [147, 51, 234, 255]
 
     return rgba
@@ -267,7 +279,7 @@ def colorize_rain(grid_2d):
     """
     Akkumulierte 48h Niederschlagssumme (mm / l/m²).
     """
-    rain = np.nan_to_num(grid_2d, nan=0)
+    rain = clean_grib_grid(grid_2d, max_valid=1000.0, min_valid=0.0)
     h, w = rain.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
@@ -295,8 +307,8 @@ def colorize_rain(grid_2d):
     mask = (rain >= 50.0) & (rain < 75.0)
     rgba[mask] = [220, 38, 38, 245]
 
-    # > 75 mm = Violett / Magenta (Extremer Starkregen)
-    mask = (rain >= 75.0)
+    # > 75 mm = Violett / Magenta (Extremer Starkregen) mit Obergrenze
+    mask = (rain >= 75.0) & (rain <= 1000.0)
     rgba[mask] = [126, 34, 206, 255]
 
     return rgba
@@ -306,7 +318,7 @@ def colorize_snow(grid_2d):
     """
     Akkumulierter Neuschnee in cm.
     """
-    snow = np.nan_to_num(grid_2d, nan=0) # in kg/m² (~cm bei Dichte 100)
+    snow = clean_grib_grid(grid_2d, max_valid=500.0, min_valid=0.0) # in kg/m² (~cm bei Dichte 100)
     h, w = snow.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
@@ -330,8 +342,8 @@ def colorize_snow(grid_2d):
     mask = (snow >= 20.0) & (snow < 35.0)
     rgba[mask] = [30, 27, 75, 250]
 
-    # > 35 cm = Schneeviolett / Pink
-    mask = (snow >= 35.0)
+    # > 35 cm = Schneeviolett / Pink mit Obergrenze
+    mask = (snow >= 35.0) & (snow <= 500.0)
     rgba[mask] = [236, 72, 153, 255]
 
     return rgba
@@ -405,7 +417,8 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
 
             img = Image.fromarray(rgba_array, mode='RGBA')
             img_resized = img.resize(target_size, Image.NEAREST)
-            img_resized.save(output_png_path, 'PNG', optimize=True)
+            # Speichere als hocheffizientes WebP mit Alpha-Transparenz
+            img_resized.save(output_png_path, 'WEBP', quality=88, method=4)
 
             min_lat = round(min(lat_first, lat_last), 2)
             max_lat = round(max(lat_first, lat_last), 2)
@@ -426,25 +439,24 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
 
 def process_single_step(step, date_str, hour_str, run_date, param_key, output_dir, temp_dir):
     """
-    Verarbeitet einen einzelnen Vorhersageschritt für einen bestimmten Parameter.
+    Verarbeitet einen einzelnen Vorhersageschritt für einen bestimmten Parameter (WebP).
     """
     config = PARAM_CONFIGS[param_key]
     dwd_var = config['dwd_var']
     scale_type = config['scale_type']
 
     step_time = run_date + timedelta(hours=step)
-    png_name = f"frame_{step:02d}.png"
-    # Für SigWx auch sigwx_XX.png als Alias unterstützen
+    webp_name = f"frame_{step:02d}.webp"
     if param_key == 'sigwx':
-        png_name = f"sigwx_{step:02d}.png"
+        webp_name = f"sigwx_{step:02d}.webp"
 
-    png_path = os.path.join(output_dir, png_name)
+    output_path = os.path.join(output_dir, webp_name)
 
     grib_file = download_dwd_file(date_str, hour_str, step, var=dwd_var, temp_dir=temp_dir)
     if not grib_file:
         return step, None, None, None
 
-    res = render_grib_to_png(grib_file, png_path, scale_type=scale_type)
+    res = render_grib_to_png(grib_file, output_path, scale_type=scale_type)
     if os.path.exists(grib_file):
         try:
             os.remove(grib_file)
@@ -454,13 +466,13 @@ def process_single_step(step, date_str, hour_str, run_date, param_key, output_di
     if res:
         bounds, exact_iso = res
         valid_iso = exact_iso or step_time.isoformat()
-        return step, png_name, bounds, valid_iso
+        return step, webp_name, bounds, valid_iso
     return step, None, None, None
 
 
 def upload_directory_to_ftp(local_dir, remote_folder):
     """
-    Lädt alle generierten Dateien per FTPS in das Verzeichnis data/{remote_folder}/ hoch.
+    Lädt alle generierten Dateien (.webp, .png, .json) per FTPS in das Verzeichnis data/{remote_folder}/ hoch.
     """
     server = os.environ.get('FTP_SERVER')
     user = os.environ.get('FTP_USERNAME')
@@ -499,7 +511,7 @@ def upload_directory_to_ftp(local_dir, remote_folder):
             except Exception as e:
                 print(f"Hinweis beim Ordnererstellen ({folder}): {e}")
 
-    files = [f for f in os.listdir(local_dir) if f.endswith('.png') or f.endswith('.json')]
+    files = [f for f in os.listdir(local_dir) if f.endswith('.webp') or f.endswith('.png') or f.endswith('.json')]
     print(f"📤 Lade {len(files)} Dateien nach data/{remote_folder}/ hoch...")
 
     uploaded_count = 0
