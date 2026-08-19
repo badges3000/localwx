@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 DWD ICON-D2 Wetter-Phänomene Generator & Uploader (localwx PRO)
+Paralleler High-Speed Multi-Thread Downloader & Renderer
 """
 
 import os
@@ -11,6 +12,7 @@ import bz2
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image
 import ftplib
@@ -22,7 +24,6 @@ try:
 except ImportError:
     ECCODES_AVAILABLE = False
 
-# localwx PRO Farbskala (Modernes Farbsystem)
 COLOR_MAP = {
     'transparent': (0, 0, 0, 0),
     'fog': (234, 179, 8, 200),               # Bodennebel (#eab308)
@@ -64,7 +65,7 @@ def download_dwd_file(date_str, hour_str, step, var="ww", temp_dir="./tmp_grib")
 
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'localwx-SigWx-Generator/2.0'})
-        with urllib.request.urlopen(req, timeout=20) as response, open(bz2_path, 'wb') as out_file:
+        with urllib.request.urlopen(req, timeout=25) as response, open(bz2_path, 'wb') as out_file:
             out_file.write(response.read())
 
         with bz2.BZ2File(bz2_path, 'rb') as f_in, open(grib_path, 'wb') as f_out:
@@ -115,11 +116,9 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                 lat_last = eccodes.codes_get(gid, 'latitudeOfLastGridPoint') / 1e6
                 lon_last = eccodes.codes_get(gid, 'longitudeOfLastGridPoint') / 1e6
 
-            # Längengrade normalisieren (GRIB2 speichert negative Werte oft als 360 - lon, z.B. 356.06° -> -3.94°)
             if lon_first > 180: lon_first -= 360
             if lon_last > 180: lon_last -= 360
 
-            # Exakte Gültigkeits-Uhrzeit aus dem GRIB-Header lesen (WMO-Standard)
             exact_valid_iso = None
             try:
                 valid_date = str(eccodes.codes_get(gid, 'validityDate'))
@@ -127,8 +126,7 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                 valid_time_str = f"{valid_time_int:04d}"
                 valid_dt = datetime.strptime(f"{valid_date}{valid_time_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
                 exact_valid_iso = valid_dt.isoformat()
-            except Exception:
-                pass
+            except Exception: pass
 
             j_scans_pos = eccodes.codes_get(gid, 'jScansPositively')
             values = eccodes.codes_get_values(gid)
@@ -147,7 +145,6 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
                     if color_key != 'transparent':
                         pixels[x, y] = COLOR_MAP[color_key]
 
-            # Falls der GRIB-Scan von Süd nach Nord läuft, Bild vertikal spiegeln
             if j_scans_pos == 1:
                 img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
@@ -159,7 +156,6 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
             min_lon = round(min(lon_first, lon_last), 2)
             max_lon = round(max(lon_first, lon_last), 2)
 
-            # Plausibilitätsprüfung für den DWD ICON-D2 Regular Germany-Domain
             if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
                 min_lat, max_lat = 43.18, 58.08
                 min_lon, max_lon = -3.94, 20.34
@@ -168,6 +164,22 @@ def render_grib_to_png(grib_path, output_png_path, target_size=(1024, 1024)):
     except Exception as e:
         print(f"Fehler beim Rendern: {e}")
         return [[43.18, -3.94], [58.08, 20.34]], None
+
+def process_single_step(step, date_str, hour_str, run_date, output_dir, temp_dir):
+    step_time = run_date + timedelta(hours=step)
+    png_name = f"sigwx_{step:02d}.png"
+    png_path = os.path.join(output_dir, png_name)
+    grib_file = download_dwd_file(date_str, hour_str, step, var="ww", temp_dir=temp_dir)
+    if not grib_file:
+        return step, None, None, None
+    res = render_grib_to_png(grib_file, png_path)
+    if os.path.exists(grib_file):
+        try: os.remove(grib_file)
+        except Exception: pass
+    if res:
+        bounds, exact_iso = res
+        return step, png_name, bounds, exact_iso or step_time.isoformat()
+    return step, None, None, None
 
 def upload_files_to_ftp(output_dir):
     server = os.environ.get('FTP_SERVER')
@@ -213,10 +225,13 @@ def upload_files_to_ftp(output_dir):
     print(f"\n🎉 ERFOLG: Alle {uploaded_count} DWD SigWx Wetterkarten liegen jetzt in data/sigwx/!")
 
 def main():
-    print("🚀 Starte DWD ICON-D2 Generator & Uploader...")
+    start_time = time.time()
+    print("🚀 Starte DWD ICON-D2 High-Speed Generator & Uploader...")
     date_str, hour_str, run_date = get_latest_model_run()
     output_dir = "./dist/sigwx"
+    temp_dir = "./tmp_grib"
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
     metadata = {
         "model": "DWD ICON-D2",
@@ -226,29 +241,44 @@ def main():
         "frames": []
     }
 
-    success_count = 0
+    max_steps = 48
     detected_bounds = None
+    results = {}
 
-    for step in range(49):
-        step_time = run_date + timedelta(hours=step)
-        png_name = f"sigwx_{step:02d}.png"
-        png_path = os.path.join(output_dir, png_name)
-        grib_file = download_dwd_file(date_str, hour_str, step, var="ww")
-        if grib_file:
-            res = render_grib_to_png(grib_file, png_path)
-            if res:
-                bounds, exact_iso = res
-                if detected_bounds is None:
-                    detected_bounds = bounds
-                    metadata["bounds"] = detected_bounds
-                metadata["frames"].append({"step": step, "valid_time": exact_iso or step_time.isoformat(), "file": png_name})
-                success_count += 1
-                if os.path.exists(grib_file): os.remove(grib_file)
+    print(f"⚡ Starte paralleles Multithreading für alle {max_steps+1} Stunden (6 Worker)...")
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(process_single_step, step, date_str, hour_str, run_date, output_dir, temp_dir): step
+            for step in range(max_steps + 1)
+        }
+
+        completed_count = 0
+        for future in as_completed(futures):
+            step = futures[future]
+            try:
+                step_idx, png_name, bounds, valid_iso = future.result()
+                if png_name and valid_iso:
+                    results[step_idx] = {
+                        "step": step_idx,
+                        "valid_time": valid_iso,
+                        "file": png_name
+                    }
+                    if bounds and detected_bounds is None:
+                        detected_bounds = bounds
+                        metadata["bounds"] = detected_bounds
+                completed_count += 1
+                if completed_count % 8 == 0 or completed_count == (max_steps + 1):
+                    print(f"   ↳ {completed_count}/{max_steps+1} Stunden verarbeitet...")
+            except Exception as e:
+                print(f"⚠️ Fehler bei Schritt {step}: {e}")
+
+    metadata["frames"] = [results[s] for s in sorted(results.keys())]
 
     with open(os.path.join(output_dir, "meta.json"), 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ {success_count} Frames gerendert.")
+    duration = round(time.time() - start_time, 1)
+    print(f"\n✅ Fertig! {len(metadata['frames'])} Frames in nur {duration} Sekunden gerendert.")
     upload_files_to_ftp(output_dir)
 
 if __name__ == "__main__":
