@@ -12,7 +12,8 @@ concurrency:
 jobs:
   generate-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Auf 30 Minuten anheben, damit Netzwerklags nicht zum Abbruch führen
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
@@ -22,16 +23,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install System Libraries
+        # Schnelle non-interaktive Installation ohne hängende Mirrors
         run: |
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -qq
+          sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends libeccodes0 libeccodes-dev bzip2
 
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir eccodes numpy pillow
+          pip install eccodes numpy pillow
 
       - name: Run DWD SigWx Generator & Uploader
         env:
