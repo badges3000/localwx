@@ -51,40 +51,56 @@ def get_latest_icon_eu_reference_time():
 
 def recolor_wms_to_turbo(img_rgba):
     """
-    Wandelt die rohen DWD WMS-Farbwerte in saubere, leuchtende Google Turbo-Farben um.
+    Wandelt DWD ICON-EU WMS-Niederschlag in echte Google Turbo-Farben um.
+    Garantiert 100% transparenten Hintergrund überall wo es trocken ist!
     """
     arr = np.array(img_rgba)
     h, w, c = arr.shape
     if c < 4:
         return img_rgba
 
-    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
-    has_content = (a > 30) & ((r > 15) | (g > 15) | (b > 15))
+    r = arr[:, :, 0].astype(int)
+    g = arr[:, :, 1].astype(int)
+    b = arr[:, :, 2].astype(int)
+    a = arr[:, :, 3].astype(int)
+
+    # Farbvarianz berechnen (Grau-/Schwarztöne des Hintergrunds ausschließen)
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    delta = max_c - min_c
+
+    # Echtes Regensignal hat Farbe (delta > 20) und ist nicht rein grau/schwarz/weiß
+    has_rain = (a > 40) & (delta > 20) & (max_c > 35)
 
     new_rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
-    # Farbmapping basierend auf Helligkeit und Farbton
-    brightness = (r.astype(float) + g.astype(float) + b.astype(float)) / 3.0
+    # 1. Leichter Regen (Blau/Cyan: viel Blau oder Türkis)
+    mask_blue = has_rain & (b > r + 15) & (g < 230)
+    new_rgba[mask_blue] = [59, 130, 246, 200]
 
-    # 1. Leichter Regen (Cyan / Türkis)
-    mask1 = has_content & (brightness < 100)
-    new_rgba[mask1] = [6, 182, 212, 190]
+    # 2. Mäßiger Regen (Türkis/Mint)
+    mask_cyan = has_rain & (g > r + 20) & (b > 120)
+    new_rgba[mask_cyan] = [6, 182, 212, 220]
 
-    # 2. Mäßiger Regen (Lime Grün)
-    mask2 = has_content & (brightness >= 100) & (brightness < 160)
-    new_rgba[mask2] = [34, 197, 94, 220]
+    # 3. Mäßig bis kräftig (Grün)
+    mask_green = has_rain & (g > r + 30) & (b <= 120)
+    new_rgba[mask_green] = [34, 197, 94, 235]
 
-    # 3. Starkregen (Goldgelb)
-    mask3 = has_content & (brightness >= 160) & (brightness < 210)
-    new_rgba[mask3] = [234, 179, 8, 240]
+    # 4. Kräftiger Regen (Gelb / Gold)
+    mask_yellow = has_rain & (r > 160) & (g > 150) & (b < 100)
+    new_rgba[mask_yellow] = [234, 179, 8, 250]
 
-    # 4. Sehr starker Regen (Orange / Rot)
-    mask4 = has_content & (brightness >= 210) & (brightness < 240)
-    new_rgba[mask4] = [249, 115, 22, 255]
+    # 5. Starkregen (Orange / Rot)
+    mask_red = has_rain & (r > 180) & (g < 140) & (b < 80)
+    new_rgba[mask_red] = [249, 115, 22, 255]
 
-    # 5. Unwetter / Extrem (Magenta / Violett)
-    mask5 = has_content & (brightness >= 240)
-    new_rgba[mask5] = [217, 70, 239, 255]
+    # 6. Unwetter / Hagel (Violett / Magenta)
+    mask_purple = has_rain & (r > 120) & (b > 120) & (g < 100)
+    new_rgba[mask_purple] = [217, 70, 239, 255]
+
+    # Unklassifizierter Rest mit Regensignal
+    unclassified = has_rain & (new_rgba[:, :, 3] == 0)
+    new_rgba[unclassified] = [6, 182, 212, 200]
 
     return Image.fromarray(new_rgba, mode='RGBA')
 
