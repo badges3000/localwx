@@ -118,6 +118,12 @@ def generate_radar_dataset():
     date_str = past_time.strftime("%Y-%m-%dT%H:%M:00Z")
     last_date_str = future_time.strftime("%Y-%m-%dT%H:%M:00Z")
 
+    url = (
+        f"https://api.brightsky.dev/radar?"
+        f"lat=51.1657&lon=10.4515&distance=850000&"
+        f"date={date_str}&last_date={last_date_str}&format=plain"
+    )
+
     data = None
     for attempt in range(3):
         try:
@@ -126,10 +132,11 @@ def generate_radar_dataset():
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             if data and data.get('radar'):
+                print(f"✅ Erfolgreich {len(data['radar'])} DWD RADOLAN-Frames empfangen!")
                 break
         except urllib.error.HTTPError as he:
-            print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}) bei Anfrage. Versuche Standard-Abfrage...")
-            url = f"https://api.brightsky.dev/radar?lat=51.1657&lon=10.4515&distance=500000&date={date_str}&format=plain"
+            print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}) bei Anfrage. Versuche Fallback...")
+            url = f"https://api.brightsky.dev/radar?lat=51.1657&lon=10.4515&distance=850000&date={date_str}&format=plain"
             time.sleep(2)
         except Exception as e:
             print(f"⚠️ Verbindungsfehler: {e}")
