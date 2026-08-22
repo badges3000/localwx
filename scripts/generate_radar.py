@@ -115,12 +115,13 @@ def generate_radar_dataset():
     past_time = now - timedelta(hours=history_hours)
     future_time = now + timedelta(hours=nowcast_hours)
 
-    print(f"📡 Lade DWD RADOLAN-Daten von {past_time.strftime('%H:%M')} bis {future_time.strftime('%H:%M')} UTC...")
+    date_str = past_time.strftime("%Y-%m-%dT%H:%M:00Z")
+    last_date_str = future_time.strftime("%Y-%m-%dT%H:%M:00Z")
 
     url = (
         f"https://api.brightsky.dev/radar?"
         f"lat=51.1657&lon=10.4515&distance=850000&"
-        f"date={past_time.isoformat()}&last_date={future_time.isoformat()}&format=plain"
+        f"date={date_str}&last_date={last_date_str}&format=plain"
     )
 
     req = urllib.request.Request(url, headers={'User-Agent': 'localwx-TurboRadar-Generator/2.0'})
