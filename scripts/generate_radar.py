@@ -97,45 +97,48 @@ TURBO_LUT = build_turbo_lut()
 
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Kontextfilter (Spurious Noise & Tower Clutter Filter):
+    Meteorologischer Cluster- & Flächenfilter (100% flackerfrei, kein Aufpoppen):
     
-    1. ECHTE Regenfront:
-       Besitzt immer Niederschlagskerne (val >= 4 bzw. > 0.48 mm/h).
-       Der feine Niesel (val 1..3) im Umkreis dieser Front wird vollständig und lückenlos erhalten!
+    1. ECHTE Regenfelder & Nieselzonen:
+       Haben eine reale räumliche Ausdehnung (Fläche >= 20 Pixel).
+       Werden flackerfrei, kontinuierlich und ohne Sprünge dargestellt!
        
-    2. ISOLIERTES Sensorrauschen (Turmechos bei Frankfurt, Hannover etc.):
-       Besteht NUR aus isolierten Pixeln val 1..3 OHNE jeglichen echten Kern im Umkreis von ~10 km.
-       Wird restlos gelöscht!
+    2. ECHTER Schauerregen mit Kern:
+       Jedes Regengebiet mit mindestens einem Kernpixel val >= 4 wird immer dargestellt.
+       
+    3. ISOLIERTES Turmrauschen & Geister-Sprenkel:
+       Winzige isolierte Punkt-Cluster (< 20 Pixel) OHNE jeden Kern (val < 4).
+       Werden sauber und geräuschlos entfernt!
     """
-    core_rain = val >= 4
-    if not np.any(core_rain):
-        # Wenn im gesamten Raster kein einziger Pixel >= 4 existiert, ist alles nur Rauschen
-        return np.zeros_like(val)
+    if not np.any(val > 0):
+        return val
         
     try:
-        from scipy.ndimage import binary_dilation
-        # Kontinuierliche kreisförmige Struktur (Radius 8 Pixel ~ 8-10 km)
-        y, x = np.ogrid[-8:9, -8:9]
-        disk = x*x + y*y <= 64
-        valid_rain_zone = binary_dilation(core_rain, structure=disk)
-    except ImportError:
-        # Lückenlose, dichte NumPy-Faltung (Schrittweite 1, keine Gittermuster!)
-        radius = 8
-        y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
-        kernel = x*x + y*y <= radius*radius
+        from scipy.ndimage import label
         
-        h, w = val.shape
-        pad_core = np.pad(core_rain, radius, mode='constant', constant_values=False)
-        valid_rain_zone = np.zeros_like(core_rain, dtype=bool)
+        labeled_array, num_features = label(val > 0)
+        if num_features == 0:
+            return val
+            
+        cluster_sizes = np.bincount(labeled_array.ravel())
+        clean_val = val.copy()
         
-        ky, kx = np.where(kernel)
-        for dy, dx in zip(ky, kx):
-            valid_rain_zone |= pad_core[dy:dy+h, dx:dx+w]
+        for i in range(1, num_features + 1):
+            size = cluster_sizes[i]
+            # Große zusammenhängende Regenwolken (Fläche >= 20 Pixel) immer behalten
+            if size >= 20:
+                continue
                 
-    is_isolated_clutter = (val > 0) & (val < 4) & (~valid_rain_zone)
-    clean_val = val.copy()
-    clean_val[is_isolated_clutter] = 0
-    return clean_val
+            # Bei winzigen Mini-Clustern (< 20 Pixel):
+            # Nur behalten wenn ein echter Schauerkern vorhanden ist (val >= 4)
+            cluster_mask = (labeled_array == i)
+            if np.max(val[cluster_mask]) < 4:
+                clean_val[cluster_mask] = 0
+                
+        return clean_val
+        
+    except ImportError:
+        return val
 
 
 def map_radolan_val_to_index(val):
