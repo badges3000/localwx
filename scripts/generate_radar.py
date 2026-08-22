@@ -118,20 +118,28 @@ def generate_radar_dataset():
     date_str = past_time.strftime("%Y-%m-%dT%H:%M:00Z")
     last_date_str = future_time.strftime("%Y-%m-%dT%H:%M:00Z")
 
-    url = (
-        f"https://api.brightsky.dev/radar?"
-        f"lat=51.1657&lon=10.4515&distance=850000&"
-        f"date={date_str}&last_date={last_date_str}&format=plain"
-    )
+    data = None
+    for attempt in range(3):
+        try:
+            print(f"📡 Lade DWD RADOLAN-Daten (Versuch {attempt+1}/3): {date_str} bis {last_date_str}...")
+            req = urllib.request.Request(url, headers={'User-Agent': 'localwx-TurboRadar-Generator/2.0'})
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            if data and data.get('radar'):
+                break
+        except urllib.error.HTTPError as he:
+            print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}) bei Anfrage. Versuche Standard-Abfrage...")
+            url = f"https://api.brightsky.dev/radar?lat=51.1657&lon=10.4515&distance=500000&date={date_str}&format=plain"
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ Verbindungsfehler: {e}")
+            time.sleep(2)
 
-    req = urllib.request.Request(url, headers={'User-Agent': 'localwx-TurboRadar-Generator/2.0'})
-    with urllib.request.urlopen(req, timeout=40) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-
-    frames_data = data.get('radar', [])
-    if not frames_data:
+    if not data or not data.get('radar'):
         print("❌ Keine Radar-Frames vom DWD-Service erhalten!")
         return
+
+    frames_data = data.get('radar', [])
 
     print(f"📦 Verarbeite {len(frames_data)} DWD RADOLAN Raster-Frames mit Turbo-Farben...")
 
