@@ -99,12 +99,12 @@ def remove_isolated_radar_clutter(val):
     """
     Meteorologischer Kontextfilter (Spurious Noise & Tower Clutter Filter):
     
-    1. ECHTE Regenfront (wie in Rostock):
+    1. ECHTE Regenfront:
        Besitzt immer Niederschlagskerne (val >= 4 bzw. > 0.48 mm/h).
-       Der feine Niesel (val 1..3) im Umkreis dieser Front wird vollständig erhalten!
+       Der feine Niesel (val 1..3) im Umkreis dieser Front wird vollständig und lückenlos erhalten!
        
     2. ISOLIERTES Sensorrauschen (Turmechos bei Frankfurt, Hannover etc.):
-       Besteht NUR aus isolierten Pixeln val 1..3 OHNE jeglichen echten Kern im Umkreis von ~10-12 km.
+       Besteht NUR aus isolierten Pixeln val 1..3 OHNE jeglichen echten Kern im Umkreis von ~10 km.
        Wird restlos gelöscht!
     """
     core_rain = val >= 4
@@ -113,16 +113,24 @@ def remove_isolated_radar_clutter(val):
         return np.zeros_like(val)
         
     try:
-        from scipy.ndimage import maximum_filter
-        valid_rain_zone = maximum_filter(core_rain, size=23)
+        from scipy.ndimage import binary_dilation
+        # Kontinuierliche kreisförmige Struktur (Radius 8 Pixel ~ 8-10 km)
+        y, x = np.ogrid[-8:9, -8:9]
+        disk = x*x + y*y <= 64
+        valid_rain_zone = binary_dilation(core_rain, structure=disk)
     except ImportError:
-        # Reines NumPy Fallback mit 2D-Faltung
-        pad_core = np.pad(core_rain, 11, mode='constant', constant_values=False)
-        valid_rain_zone = np.zeros_like(core_rain, dtype=bool)
+        # Lückenlose, dichte NumPy-Faltung (Schrittweite 1, keine Gittermuster!)
+        radius = 8
+        y, x = np.ogrid[-radius:radius+1, -radius:radius+1]
+        kernel = x*x + y*y <= radius*radius
+        
         h, w = val.shape
-        for dy in range(0, 23, 5):
-            for dx in range(0, 23, 5):
-                valid_rain_zone |= pad_core[dy:dy+h, dx:dx+w]
+        pad_core = np.pad(core_rain, radius, mode='constant', constant_values=False)
+        valid_rain_zone = np.zeros_like(core_rain, dtype=bool)
+        
+        ky, kx = np.where(kernel)
+        for dy, dx in zip(ky, kx):
+            valid_rain_zone |= pad_core[dy:dy+h, dx:dx+w]
                 
     is_isolated_clutter = (val > 0) & (val < 4) & (~valid_rain_zone)
     clean_val = val.copy()
