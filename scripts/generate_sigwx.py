@@ -80,6 +80,13 @@ PARAM_CONFIGS = {
         'unit': 'J/kg',
         'scale_type': 'cape'
     },
+    'precip_rate': {
+        'dwd_var': 'tot_prec',
+        'folder': 'precip_rate',
+        'title': '48h Niederschlagsvorhersage (stündlich)',
+        'unit': 'mm/h',
+        'scale_type': 'precip_rate'
+    },
     'rain': {
         'dwd_var': 'tot_prec',
         'folder': 'rain',
@@ -275,6 +282,47 @@ def colorize_cape(grid_2d):
     return rgba
 
 
+def colorize_precip_rate(grid_2d):
+    """
+    Stündliche Niederschlagsrate in mm/h mit Google Turbo-Farbskala:
+    0.1 - 0.5 mm/h: Saphirblau / Indigo
+    0.5 - 2.5 mm/h: Cyan / Türkis
+    2.5 - 5.0 mm/h: Frisches Lime-Grün
+    5.0 - 10.0 mm/h: Vivid Gold / Gelb
+    10.0 - 25.0 mm/h: Leuchtendes Orange-Rot
+    > 25.0 mm/h: Magenta / Tiefviolett
+    """
+    precip = clean_grib_grid(grid_2d, max_valid=300.0, min_valid=0.0)
+    h, w = precip.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+
+    # 0.1 - 0.5 mm/h = Saphirblau / Indigo
+    mask = (precip >= 0.1) & (precip < 0.5)
+    rgba[mask] = [59, 130, 246, 170]
+
+    # 0.5 - 2.5 mm/h = Cyan / Türkis
+    mask = (precip >= 0.5) & (precip < 2.5)
+    rgba[mask] = [6, 182, 212, 210]
+
+    # 2.5 - 5.0 mm/h = Frisches Lime-Grün
+    mask = (precip >= 2.5) & (precip < 5.0)
+    rgba[mask] = [34, 197, 94, 235]
+
+    # 5.0 - 10.0 mm/h = Vivid Gold / Gelb
+    mask = (precip >= 5.0) & (precip < 10.0)
+    rgba[mask] = [234, 179, 8, 250]
+
+    # 10.0 - 25.0 mm/h = Leuchtendes Orange-Rot
+    mask = (precip >= 10.0) & (precip < 25.0)
+    rgba[mask] = [249, 115, 22, 255]
+
+    # > 25.0 mm/h = Magenta / Tiefviolett
+    mask = (precip >= 25.0) & (precip <= 300.0)
+    rgba[mask] = [217, 70, 239, 255]
+
+    return rgba
+
+
 def colorize_rain(grid_2d):
     """
     Akkumulierte 48h Niederschlagssumme (mm / l/m²).
@@ -400,6 +448,8 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
             # Vektorisierte Farb-Transformation je nach Skalentyp
             if scale_type == 'sigwx':
                 rgba_array = colorize_sigwx(grid_2d)
+            elif scale_type == 'precip_rate':
+                rgba_array = colorize_precip_rate(grid_2d)
             elif scale_type == 'wind':
                 rgba_array = colorize_wind(grid_2d)
             elif scale_type == 'cape':
@@ -557,7 +607,7 @@ def process_parameter(param_key, date_str, hour_str, run_date, max_steps=48):
     detected_bounds = None
     results = {}
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {
             executor.submit(process_single_step, step, date_str, hour_str, run_date, param_key, output_dir, temp_dir): step
             for step in range(max_steps + 1)
