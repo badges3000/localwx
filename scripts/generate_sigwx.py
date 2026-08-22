@@ -650,7 +650,7 @@ def main():
     parser = argparse.ArgumentParser(description="DWD ICON-D2 Multi-Model Map Generator")
     parser.add_argument(
         '--param',
-        choices=['all', 'sigwx', 'wind', 'cape', 'rain', 'snow'],
+        choices=['all', 'precip_rate', 'sigwx', 'wind', 'cape', 'rain', 'snow'],
         default='all',
         help="Welcher Parameter generiert werden soll (Standard: all)"
     )
@@ -663,7 +663,7 @@ def main():
     print(f"📅 DWD Modell-Lauf: {date_str} {hour_str}:00 UTC")
 
     if args.param == 'all':
-        active_params = ['sigwx', 'wind', 'cape', 'rain', 'snow']
+        active_params = ['precip_rate', 'sigwx', 'wind', 'cape', 'rain', 'snow']
     else:
         active_params = [args.param]
 
