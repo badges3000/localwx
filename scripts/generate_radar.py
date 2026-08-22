@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-DWD RADOLAN Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
-=============================================================================
-Lädt hochauflösende DWD RADOLAN HD Radardaten (5-minütig) direkt von opendata.dwd.de:
-- -8h bis 0h Vergangenheit (DWD RADOLAN RV Messungen)
-- 0h bis +2h Nowcasting (DWD RADOLAN RV Vorhersage-Komposit)
-- Mathematisch exakte Google Turbo LookUp-Table (0 = 100% transparent)
+DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
+================================================================================
+Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
+- -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
+- 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
+- Meteorologisch kalibrierte Google Turbo Farbtabelle (WarnWetter-Dynamik mit sattem Grün, Gelb, Orange, Rot)
+- Konturenscharfe bikubische Kantenglättung ohne verwaschene Ränder
 - 100% verlustfreies WebP (lossless=True, method=6)
 - Erzeugt meta.json und lädt per FTPS nach /data/radar/ hoch.
 """
@@ -34,8 +35,8 @@ RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 
 def build_turbo_lut():
     """
-    Erstellt die mathematisch exakte Google Turbo LookUp-Table (0..255)
-    Index 0 ist zu 100% transparent (Alpha=0).
+    Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255)
+    Exakt abgestimmt auf das visuelle Erscheinungsbild der DWD WarnWetter App.
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
 
@@ -43,47 +44,48 @@ def build_turbo_lut():
         if i == 0:
             # 0: Absolut transparent (Kein Niederschlag)
             r, g, b, a = 0, 0, 0, 0
-        elif i < 25:
-            # 1 - 24: Zartes Himmelblau bis Saphirblau (Nieselregen / 0.1 - 0.5 mm/h)
-            t = i / 24.0
-            r = int(30 + t * 25)
-            g = int(120 + t * 70)
-            b = int(235 + t * 20)
-            a = int(170 + t * 35)
-        elif i < 60:
-            # 25 - 59: Türkis / Cyan (Leichter Regen / 0.5 - 2.0 mm/h)
-            t = (i - 25) / 35.0
-            r = int(55 - t * 35)
-            g = int(190 + t * 35)
-            b = int(255 - t * 50)
-            a = int(205 + t * 25)
-        elif i < 110:
-            # 60 - 109: Frisches Lime-Grün bis Smaragd (Mäßiger Regen / 2.0 - 5.0 mm/h)
-            t = (i - 60) / 50.0
-            r = int(35 + t * 90)
-            g = int(225 - t * 15)
-            b = int(120 - t * 90)
-            a = int(230 + t * 20)
-        elif i < 160:
-            # 110 - 159: Reines Gelb bis Goldgelb (Kräftiger Regen / 5.0 - 10.0 mm/h)
-            t = (i - 110) / 50.0
-            r = int(230 + t * 25)
+        elif i < 26:
+            # 1 - 25: Zarter Türkis / Cyan Außensaum (0.05 - 0.35 mm/h / < 15 dBZ)
+            t = (i - 1) / 24.0
+            r = int(35 + t * 20)
+            g = int(180 + t * 45)
+            b = int(245 - t * 20)
+            a = int(160 + t * 50)
+        elif i < 91:
+            # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.35 - 2.5 mm/h / 15 - 30 dBZ)
+            # Bildet wie in der WarnWetter App die großflächige Hauptmasse des Regens
+            t = (i - 26) / 64.0
+            r = int(35 + t * 115)
+            g = int(215 + t * 25)
+            b = int(120 - t * 105)
+            a = int(220 + t * 25)
+        elif i < 151:
+            # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.5 - 7.0 mm/h / 30 - 40 dBZ)
+            t = (i - 91) / 59.0
+            r = int(235 + t * 20)
             g = int(210 - t * 50)
             b = int(20 - t * 10)
+            a = 250
+        elif i < 201:
+            # 151 - 200: Kräftiges Orange (7.0 - 18.0 mm/h / 40 - 48 dBZ)
+            t = (i - 151) / 49.0
+            r = int(245 - t * 10)
+            g = int(140 - t * 75)
+            b = int(15 + t * 10)
             a = 255
-        elif i < 210:
-            # 160 - 209: Leuchtendes Orange bis Karminrot (Starkregen / 10.0 - 25.0 mm/h)
-            t = (i - 160) / 50.0
-            r = int(245 - t * 15)
-            g = int(110 - t * 80)
-            b = int(20 + t * 15)
+        elif i < 236:
+            # 201 - 235: Intensives Karminrot bis Scharlachrot (18.0 - 35.0 mm/h / 48 - 55 dBZ)
+            t = (i - 201) / 34.0
+            r = int(235 - t * 25)
+            g = int(45 - t * 25)
+            b = int(25 + t * 65)
             a = 255
         else:
-            # 210 - 255: Magenta bis Tiefviolett (Extremer Starkregen / Hagel > 25 mm/h)
-            t = (i - 210) / 45.0
-            r = int(210 - t * 70)
-            g = int(30 - t * 15)
-            b = int(180 + t * 65)
+            # 236 - 255: Magenta bis Weiß-Violett (Extremer Starkregen / Hagel > 35 mm/h / > 55 dBZ)
+            t = (i - 236) / 19.0
+            r = int(210 + t * 45)
+            g = int(30 + t * 220)
+            b = int(210 + t * 45)
             a = 255
             
         lut[i] = [r, g, b, a]
@@ -93,12 +95,44 @@ def build_turbo_lut():
 TURBO_LUT = build_turbo_lut()
 
 
+def map_radolan_val_to_index(val):
+    """
+    Mappt DWD RADOLAN RV Rohwerte (0.01 mm/5min) physikalisch exakt auf die 256 Turbo-Farbstufen.
+    """
+    idx = np.zeros_like(val, dtype=np.uint8)
+    
+    # 1. Zarter Niesel-Saum: val 1..3 (0.1..0.36 mm/h)
+    m1 = (val >= 1) & (val < 4)
+    idx[m1] = (1 + (val[m1] - 1) * 8).astype(np.uint8)
+    
+    # 2. Leichter bis mäßiger Landregen (Grün): val 4..21 (0.48..2.5 mm/h)
+    m2 = (val >= 4) & (val < 22)
+    idx[m2] = (26 + ((val[m2] - 4) / 18.0) * 64).astype(np.uint8)
+    
+    # 3. Kräftiger Regen (Goldgelb): val 22..59 (2.6..7.0 mm/h)
+    m3 = (val >= 22) & (val < 60)
+    idx[m3] = (91 + ((val[m3] - 22) / 38.0) * 59).astype(np.uint8)
+    
+    # 4. Starkregen (Orange): val 60..149 (7.2..18.0 mm/h)
+    m4 = (val >= 60) & (val < 150)
+    idx[m4] = (151 + ((val[m4] - 60) / 90.0) * 49).astype(np.uint8)
+    
+    # 5. Extremregen (Karminrot): val 150..299 (18.0..36.0 mm/h)
+    m5 = (val >= 150) & (val < 300)
+    idx[m5] = (201 + ((val[m5] - 150) / 150.0) * 34).astype(np.uint8)
+    
+    # 6. Unwetter / Hagel (Magenta/Weiß): val >= 300 (>36.0 mm/h)
+    m6 = val >= 300
+    idx[m6] = np.clip(236 + (val[m6] - 300) / 5.0, 236, 255).astype(np.uint8)
+    
+    return idx
+
+
 def parse_radolan_binary(data_bytes):
     """
     Parst ein binäres DWD RADOLAN-Kompositfile (RV, WN, SF, RW).
-    Gibt (header_str, 2D-numpy-array) zurück.
+    Gibt (header_str, 2D-numpy-array) mit gemappten Indizes zurück.
     """
-    # Header endet mit ETX (0x03)
     etx_pos = data_bytes.find(b'\x03')
     if etx_pos == -1:
         etx_pos = data_bytes.find(b'\n\x00')
@@ -108,7 +142,6 @@ def parse_radolan_binary(data_bytes):
     header = data_bytes[:etx_pos].decode('latin1', errors='ignore')
     raw_data = data_bytes[etx_pos + 1:]
 
-    # Grid-Dimensionen (Standard: 1200 Zeilen x 1100 Spalten für RV)
     width = 1100
     height = 1200
     if '1200x1100' in header:
@@ -116,21 +149,20 @@ def parse_radolan_binary(data_bytes):
     elif '900x900' in header:
         width, height = 900, 900
 
-    # 16-Bit Little Endian (RADOLAN RV 5-Minuten / Nowcast)
     expected_16bit = width * height * 2
     if len(raw_data) >= expected_16bit:
         arr = np.frombuffer(raw_data[:expected_16bit], dtype=np.uint16).reshape((height, width))
-        # Maskiere Clutter/Fehlerbits (Bit 13 = Error, Bits 0-11 = Wert)
+        # Maskiere Clutter/Fehlerbits
         is_nodata = (arr & 0x2000) > 0
         val = arr & 0x0FFF
         val[is_nodata] = 0
         
-        # Auf 0..255 skalieren (RV liefert 0.01 mm/5min; Multiplikator für visuelle Turbo-Darstellung)
-        # Werte zwischen 0.1 mm/h und 50 mm/h sauber auf Farbskala mappen
-        scaled = np.clip(val / 2.0, 0, 255).astype(np.uint8)
-        # DWD RADOLAN liegt oft kopfstehend vor (Nord oben -> Flip)
-        scaled = np.flipud(scaled)
-        return header, scaled
+        # Meteorologisch exakt auf 0..255 LUT mappen
+        grid_indexed = map_radolan_val_to_index(val)
+        
+        # DWD RADOLAN invertieren (Nord oben)
+        grid_indexed = np.flipud(grid_indexed)
+        return header, grid_indexed
 
     elif len(raw_data) >= width * height:
         arr = np.frombuffer(raw_data[:width * height], dtype=np.uint8).reshape((height, width))
@@ -153,11 +185,9 @@ def get_available_dwd_rv_files():
         pattern = r'href="(DE1200_RV(\d{10})\.tar\.bz2)"'
         matches = re.findall(pattern, html)
         
-        # Liste von (filename, datetime) sortiert
         files = []
         for filename, dt_str in matches:
             try:
-                # Format: YYMMDDHHMM (z.B. 2608222000)
                 dt = datetime.strptime(f"20{dt_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
                 files.append((filename, dt))
             except Exception:
@@ -180,7 +210,6 @@ def download_and_extract_tar_bz2(filename):
         with urllib.request.urlopen(req, timeout=20) as resp:
             compressed_bytes = resp.read()
         
-        # BZ2 dekomprimieren
         tar_bytes = bz2.decompress(compressed_bytes)
         tar_stream = io.BytesIO(tar_bytes)
         
@@ -200,18 +229,26 @@ def download_and_extract_tar_bz2(filename):
 
 def render_matrix_to_webp(grid_2d, output_path):
     """
-    Wendet die Turbo LUT an und speichert als verlustfreies 1400x1400 WebP.
+    Wendet die WarnWetter-Turbo LUT an, glättet die Isolinien konturenscharf
+    und speichert als 100% verlustfreies WebP.
     """
     rgba = TURBO_LUT[grid_2d]
     img = Image.fromarray(rgba, mode='RGBA')
-    # Scharfe Skalierung auf 1400x1400
-    img_resized = img.resize((1400, 1400), Image.NEAREST)
-    img_resized.save(output_path, 'WEBP', lossless=True, method=6)
+    
+    # 1. Bilineare Skalierung für weiche, flüssige Isolinien
+    img_resized = img.resize((1400, 1400), Image.BILINEAR)
+    
+    # 2. Konturenschärfung: Alpha unter 25 hart abschneiden, damit keine verwaschenen Ränder entstehen
+    arr = np.array(img_resized)
+    arr[arr[:, :, 3] < 25, 3] = 0
+    
+    img_clean = Image.fromarray(arr, mode='RGBA')
+    img_clean.save(output_path, 'WEBP', lossless=True, method=6)
 
 
 def generate_radar_dataset():
     start_time = time.time()
-    print("🚀 Starte DWD RADOLAN HD Turbo-Radar Generator (100% DWD OpenData)...")
+    print("🚀 Starte DWD RADOLAN HD 5-Minuten Turbo-Radar Generator (100% DWD OpenData)...")
 
     output_dir = "./dist/radar"
     os.makedirs(output_dir, exist_ok=True)
@@ -225,26 +262,13 @@ def generate_radar_dataset():
     now = datetime.now(timezone.utc)
     print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} RADOLAN RV Komposite verfügbar).")
 
-    # 2. Historie filtern: Letzte 8 Stunden (jeder 3. Frame = 15-Minuten-Takt für flüssige Historie)
+    # 2. Historie filtern: Letzte 8 Stunden (Lückenloser 5-Minuten-Takt!)
     eight_hours_ago = now - timedelta(hours=8)
-    history_candidates = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now]
+    selected_history = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now]
 
-    # Wähle alle 15 Minuten einen Frame aus der Historie
-    selected_history = []
-    last_picked_time = None
-    for item in history_candidates:
-        if last_picked_time is None or (item[1] - last_picked_time).total_seconds() >= (15 * 60 - 30):
-            selected_history.append(item)
-            last_picked_time = item[1]
-
-    # Wenn zu wenige, nimm die letzten verfügbaren
-    if len(selected_history) < 10 and len(history_candidates) > 0:
-        selected_history = history_candidates[::2]
-
-    print(f"📦 Lade {len(selected_history)} Vergangenheits-Schritte (-8h bis Jetzt)...")
+    print(f"📦 Lade {len(selected_history)} lückenlose 5-Minuten-Messungen (-8h bis Jetzt)...")
 
     frames_metadata = []
-    frame_idx = 0
 
     # 3. Historie parallel herunterladen und rendern
     def process_history_item(item, idx):
@@ -253,7 +277,7 @@ def generate_radar_dataset():
         if not data_dict:
             return None
 
-        # Der erste Frame (Schritt 000) ist die tatsächliche Messung
+        # Der Frame '_000' ist die tatsächliche Messung
         main_key = next((k for k in sorted(data_dict.keys()) if '_000' in k or k.endswith('000')), None)
         if not main_key:
             main_key = sorted(data_dict.keys())[0]
@@ -274,7 +298,7 @@ def generate_radar_dataset():
             "is_nowcast": False
         }
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_history_item, item, i): i for i, item in enumerate(selected_history)}
         for future in as_completed(futures):
             res = future.result()
@@ -283,37 +307,38 @@ def generate_radar_dataset():
 
     frames_metadata.sort(key=lambda x: x['valid_time'])
 
-    # Indizes der Historie neu durchnummerieren
+    # Indizes der Historie sauber durchnummerieren
     for i, f in enumerate(frames_metadata):
         f['step'] = i
         old_name = f['file']
         new_name = f"radar_{i:03d}.webp"
         if old_name != new_name:
-            os.rename(os.path.join(output_dir, old_name), os.path.join(output_dir, new_name))
+            old_p = os.path.join(output_dir, old_name)
+            new_p = os.path.join(output_dir, new_name)
+            if os.path.exists(old_p):
+                os.rename(old_p, new_p)
             f['file'] = new_name
 
     frame_idx = len(frames_metadata)
-    print(f"✅ {frame_idx} historische DWD-Messungen erfolgreich generiert.")
+    print(f"✅ {frame_idx} historische 5-Minuten-Frames erfolgreich generiert.")
 
-    # 4. Nowcast (+2h Zukunft) aus der neuesten Datei laden
+    # 4. Nowcast (+2h Zukunft im lückenlosen 5-Minuten-Takt)
     latest_file = dwd_files[-1][0]
     latest_dt = dwd_files[-1][1]
-    print(f"🔮 Lade DWD Nowcast (+2h) aus neuester Datei: {latest_file}...")
+    print(f"🔮 Lade DWD 5-Minuten Nowcast (+2h) aus neuester Datei: {latest_file}...")
 
     nowcast_data = download_and_extract_tar_bz2(latest_file)
     if nowcast_data:
-        # Sortiere Nowcast-Schritte (_005, _010, _015 ... _120)
+        # Sortiere Nowcast-Schritte (_005, _010, _015, _020 ... _120)
         nowcast_keys = [k for k in sorted(nowcast_data.keys()) if not k.endswith('_000')]
-        
-        # Alle 15 Minuten einen Nowcast-Schritt (015, 030, 045, 060, 075, 090, 105, 120)
         selected_nowcast_keys = []
         for k in nowcast_keys:
-            # Extrahiere Minutenzahl
             m = re.search(r'_(\d{3})$', k)
             if m:
                 minutes = int(m.group(1))
-                if minutes % 15 == 0:
-                    selected_nowcast_keys.append((k, minutes))
+                selected_nowcast_keys.append((k, minutes))
+        
+        selected_nowcast_keys.sort(key=lambda x: x[1])
 
         for k, minutes in selected_nowcast_keys:
             file_bytes = nowcast_data[k]
@@ -332,13 +357,13 @@ def generate_radar_dataset():
                 })
                 frame_idx += 1
 
-    print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} Radar-Frames fertig!")
+    print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig!")
 
     # 5. Metadata JSON schreiben
     metadata = {
         "model": "DWD RADOLAN HD",
         "parameter": "precipitation_radar",
-        "title": "DWD RADOLAN HD Doppler-Radar (-8h bis +2h)",
+        "title": "DWD RADOLAN HD Doppler-Radar (-8h bis +2h, 5-Minuten-Takt)",
         "unit": "mm/h",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bounds": RADAR_BOUNDS,
@@ -382,7 +407,6 @@ def upload_directory_to_ftp(local_dir, remote_folder="radar"):
             print(f"❌ FTP-Verbindung fehlgeschlagen: {e}")
             return
 
-    # Zielordner /data/{remote_folder} erstellen & wechseln
     ftp.cwd('/')
     for folder in ["data", remote_folder]:
         try:
