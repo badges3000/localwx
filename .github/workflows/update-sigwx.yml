@@ -7,12 +7,12 @@ on:
 
 concurrency:
   group: sigwx-pipeline
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   generate-and-deploy:
     runs-on: ubuntu-latest
-    # Auf 30 Minuten anheben, damit Netzwerklags nicht zum Abbruch führen
+    # Auf 30 Minuten anheben, damit Netzwerklags nie wieder zum Abbruch führen
     timeout-minutes: 30
 
     steps:
@@ -26,10 +26,11 @@ jobs:
           cache: 'pip'
 
       - name: Install System Libraries
-        # Schnelle non-interaktive Installation ohne hängende Mirrors
+        # Schnelle non-interaktive Installation (nur libeccodes0, IPv4 erzwungen)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends libeccodes0 libeccodes-dev bzip2
+          sudo apt-get update -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=10 -y
+          sudo apt-get install -y --no-install-recommends libeccodes0 bzip2
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libeccodes.so.0 /usr/lib/x86_64-linux-gnu/libeccodes.so 2>/dev/null || true
 
       - name: Install Python Dependencies
         run: |
@@ -46,6 +47,17 @@ jobs:
             python scripts/generate_sigwx.py
           elif [ -f "generate_sigwx.py" ]; then
             python generate_sigwx.py
-          else
-            echo "Fehler: generate_sigwx.py nicht gefunden!" && exit 1
           fi
+
+      - name: Run DWD Turbo Radar Generator & Uploader
+        env:
+          FTP_SERVER: ${{ secrets.FTP_SERVER }}
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          if [ -f "scripts/generate_radar.py" ]; then
+            python scripts/generate_radar.py
+          elif [ -f "generate_radar.py" ]; then
+            python generate_radar.py
+          fi
+
