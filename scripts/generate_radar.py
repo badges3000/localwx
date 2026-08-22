@@ -27,8 +27,9 @@ from PIL import Image
 import ftplib
 import ssl
 
-# Deutschland Bounding Box für RADOLAN (DWD National Grid)
-RADAR_BOUNDS = [[46.8, 5.5], [55.6, 15.8]]
+# Exakte DWD RADOLAN DE1200 Bounding Box (1100x1200 Polar-Stereographic Grid)
+# SW: [45.68°N, 1.46°E] bis NE: [55.86°N, 18.73°E]
+RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 
 
 def build_turbo_lut():
