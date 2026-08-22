@@ -53,6 +53,7 @@ def recolor_wms_to_turbo(img_rgba):
     """
     Wandelt DWD ICON-EU WMS-Niederschlag in echte Google Turbo-Farben um.
     Garantiert 100% transparenten Hintergrund überall wo es trocken ist!
+    Farbstufen: Tiefblau -> Türkis -> Smaragdgrün -> Goldgelb -> Orange-Rot -> Magenta
     """
     arr = np.array(img_rgba)
     h, w, c = arr.shape
@@ -74,33 +75,33 @@ def recolor_wms_to_turbo(img_rgba):
 
     new_rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
-    # 1. Leichter Regen (Blau/Cyan: viel Blau oder Türkis)
-    mask_blue = has_rain & (b > r + 15) & (g < 230)
-    new_rgba[mask_blue] = [59, 130, 246, 200]
+    # 1. Nieselregen (Tiefblau: 0.1 - 0.5 mm/3h)
+    mask_blue = has_rain & (b > r + 30) & (b > g)
+    new_rgba[mask_blue] = [46, 98, 216, 190]
 
-    # 2. Mäßiger Regen (Türkis/Mint)
-    mask_cyan = has_rain & (g > r + 20) & (b > 120)
-    new_rgba[mask_cyan] = [6, 182, 212, 220]
+    # 2. Leichter Regen (Türkis / Cyan: 0.5 - 2.0 mm/3h)
+    mask_cyan = has_rain & (g > r + 15) & (b > 130) & ~mask_blue
+    new_rgba[mask_cyan] = [54, 170, 253, 215]
 
-    # 3. Mäßig bis kräftig (Grün)
-    mask_green = has_rain & (g > r + 30) & (b <= 120)
+    # 3. Mäßiger Regen (Smaragd / Frisches Lime-Grün: 2.0 - 5.0 mm/3h)
+    mask_green = has_rain & (g > r) & (g > b) & ~mask_blue & ~mask_cyan
     new_rgba[mask_green] = [34, 197, 94, 235]
 
-    # 4. Kräftiger Regen (Gelb / Gold)
-    mask_yellow = has_rain & (r > 160) & (g > 150) & (b < 100)
-    new_rgba[mask_yellow] = [234, 179, 8, 250]
+    # 4. Kräftiger Regen (Goldgelb: 5.0 - 10.0 mm/3h)
+    mask_yellow = has_rain & (r > 170) & (g > 150) & (b < 120) & ~mask_green
+    new_rgba[mask_yellow] = [251, 182, 55, 250]
 
-    # 5. Starkregen (Orange / Rot)
-    mask_red = has_rain & (r > 180) & (g < 140) & (b < 80)
-    new_rgba[mask_red] = [249, 115, 22, 255]
+    # 5. Starkregen (Leuchtendes Orange / Karminrot: 10.0 - 25.0 mm/3h)
+    mask_orange_red = has_rain & (r > 180) & (g < 140) & (b < 90)
+    new_rgba[mask_orange_red] = [234, 92, 25, 255]
 
-    # 6. Unwetter / Hagel (Violett / Magenta)
-    mask_purple = has_rain & (r > 120) & (b > 120) & (g < 100)
+    # 6. Unwetter / Hagel (Magenta / Violett: > 25 mm/3h)
+    mask_purple = has_rain & (r > 130) & (b > 130) & (g < 120)
     new_rgba[mask_purple] = [217, 70, 239, 255]
 
-    # Unklassifizierter Rest mit Regensignal
+    # Unklassifizierter Rest mit Regensignal -> sauberes Mint-Grün
     unclassified = has_rain & (new_rgba[:, :, 3] == 0)
-    new_rgba[unclassified] = [6, 182, 212, 200]
+    new_rgba[unclassified] = [26, 228, 182, 210]
 
     return Image.fromarray(new_rgba, mode='RGBA')
 
