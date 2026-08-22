@@ -488,6 +488,71 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
         return [[43.18, -3.94], [58.08, 20.34]], None
 
 
+def render_hourly_precip_diff(grib_curr_path, grib_prev_path, output_webp_path):
+    """
+    Berechnet die echte stündliche Niederschlagsdifferenz (tot_prec[t] - tot_prec[t-1]) in mm/h.
+    """
+    if not os.path.exists(grib_curr_path) or not os.path.exists(grib_prev_path):
+        return None
+    try:
+        with open(grib_curr_path, 'rb') as fc, open(grib_prev_path, 'rb') as fp:
+            gid_c = eccodes.codes_grib_new_from_file(fc)
+            gid_p = eccodes.codes_grib_new_from_file(fp)
+            if not gid_c or not gid_p:
+                return None
+
+            Ni = eccodes.codes_get(gid_c, 'Ni')
+            Nj = eccodes.codes_get(gid_c, 'Nj')
+            lat_first = eccodes.codes_get(gid_c, 'latitudeOfFirstGridPoint') / 1e6
+            lon_first = eccodes.codes_get(gid_c, 'longitudeOfFirstGridPoint') / 1e6
+            lat_last = eccodes.codes_get(gid_c, 'latitudeOfLastGridPoint') / 1e6
+            lon_last = eccodes.codes_get(gid_c, 'longitudeOfLastGridPoint') / 1e6
+            j_scans_pos = eccodes.codes_get(gid_c, 'jScansPositively')
+
+            if lon_first > 180: lon_first -= 360
+            if lon_last > 180: lon_last -= 360
+
+            exact_valid_iso = None
+            try:
+                valid_date = str(eccodes.codes_get(gid_c, 'validityDate'))
+                valid_time_int = eccodes.codes_get(gid_c, 'validityTime')
+                valid_time_str = f"{valid_time_int:04d}"
+                valid_dt = datetime.strptime(f"{valid_date}{valid_time_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+                exact_valid_iso = valid_dt.isoformat()
+            except Exception:
+                pass
+
+            vals_curr = eccodes.codes_get_values(gid_c).reshape((Nj, Ni))
+            vals_prev = eccodes.codes_get_values(gid_p).reshape((Nj, Ni))
+            eccodes.codes_release(gid_c)
+            eccodes.codes_release(gid_p)
+
+            # Echte stündliche Niederschlagsrate:
+            hourly_rain = np.maximum(0.0, vals_curr - vals_prev)
+            rgba_array = colorize_precip_rate(hourly_rain)
+
+            if j_scans_pos == 1:
+                rgba_array = np.flipud(rgba_array)
+
+            img = Image.fromarray(rgba_array, mode='RGBA')
+            img_resized = img.resize((1400, 1400), Image.NEAREST)
+            img_resized.save(output_webp_path, 'WEBP', lossless=True, method=6)
+
+            min_lat = round(min(lat_first, lat_last), 2)
+            max_lat = round(max(lat_first, lat_last), 2)
+            min_lon = round(min(lon_first, lon_last), 2)
+            max_lon = round(max(lon_first, lon_last), 2)
+
+            if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
+                min_lat, max_lat = 43.18, 58.08
+                min_lon, max_lon = -3.94, 20.34
+
+            return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
+    except Exception as e:
+        print(f"Fehler bei Niederschlagsdifferenz: {e}")
+        return None
+
+
 def process_single_step(step, date_str, hour_str, run_date, param_key, output_dir, temp_dir):
     """
     Verarbeitet einen einzelnen Vorhersageschritt für einen bestimmten Parameter (WebP).
@@ -502,6 +567,30 @@ def process_single_step(step, date_str, hour_str, run_date, param_key, output_di
         webp_name = f"sigwx_{step:02d}.webp"
 
     output_path = os.path.join(output_dir, webp_name)
+
+    # Spezialfall: Stündliche Regenrate (Differenz zur Vorstunde)
+    if param_key == 'precip_rate':
+        if step == 0:
+            # Stunde 0: Transparent
+            empty = Image.new('RGBA', (1400, 1400), (0, 0, 0, 0))
+            empty.save(output_path, 'WEBP', lossless=True)
+            return step, webp_name, [[43.18, -3.94], [58.08, 20.34]], step_time.isoformat()
+        else:
+            grib_curr = download_dwd_file(date_str, hour_str, step, var='tot_prec', temp_dir=temp_dir)
+            grib_prev = download_dwd_file(date_str, hour_str, step - 1, var='tot_prec', temp_dir=temp_dir)
+            if not grib_curr or not grib_prev:
+                return step, None, None, None
+
+            res = render_hourly_precip_diff(grib_curr, grib_prev, output_path)
+            for f in [grib_curr, grib_prev]:
+                if f and os.path.exists(f):
+                    try: os.remove(f)
+                    except Exception: pass
+
+            if res:
+                bounds, exact_iso = res
+                return step, webp_name, bounds, exact_iso or step_time.isoformat()
+            return step, None, None, None
 
     grib_file = download_dwd_file(date_str, hour_str, step, var=dwd_var, temp_dir=temp_dir)
     if not grib_file:
