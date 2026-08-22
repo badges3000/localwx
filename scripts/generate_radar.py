@@ -18,6 +18,7 @@ import json
 import time
 import argparse
 import urllib.request
+import urllib.parse
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,14 +116,18 @@ def generate_radar_dataset():
     past_time = now - timedelta(hours=history_hours)
     future_time = now + timedelta(hours=nowcast_hours)
 
-    date_str = past_time.strftime("%Y-%m-%dT%H:%M:00Z")
-    last_date_str = future_time.strftime("%Y-%m-%dT%H:%M:00Z")
+    date_str = past_time.strftime("%Y-%m-%dT%H:00:00Z")
+    last_date_str = future_time.strftime("%Y-%m-%dT%H:00:00Z")
 
-    url = (
-        f"https://api.brightsky.dev/radar?"
-        f"lat=51.1657&lon=10.4515&distance=850000&"
-        f"date={date_str}&last_date={last_date_str}&format=plain"
-    )
+    params = urllib.parse.urlencode({
+        'lat': '51.1657',
+        'lon': '10.4515',
+        'distance': '850000',
+        'date': date_str,
+        'last_date': last_date_str,
+        'format': 'plain'
+    })
+    url = f"https://api.brightsky.dev/radar?{params}"
 
     data = None
     for attempt in range(3):
@@ -136,7 +141,14 @@ def generate_radar_dataset():
                 break
         except urllib.error.HTTPError as he:
             print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}) bei Anfrage. Versuche Fallback...")
-            url = f"https://api.brightsky.dev/radar?lat=51.1657&lon=10.4515&distance=850000&date={date_str}&format=plain"
+            params_fb = urllib.parse.urlencode({
+                'lat': '51.1657',
+                'lon': '10.4515',
+                'distance': '850000',
+                'date': date_str,
+                'format': 'plain'
+            })
+            url = f"https://api.brightsky.dev/radar?{params_fb}"
             time.sleep(2)
         except Exception as e:
             print(f"⚠️ Verbindungsfehler: {e}")
