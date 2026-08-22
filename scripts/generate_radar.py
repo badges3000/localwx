@@ -98,37 +98,33 @@ TURBO_LUT = build_turbo_lut()
 def map_radolan_val_to_index(val):
     """
     Mappt DWD RADOLAN RV Rohwerte (0.01 mm/5min) physikalisch exakt auf die 256 Turbo-Farbstufen.
-    Wendet ein meteorologisches Noise-Gate an, um falsch-positive Bodenechos (Clutter/Inversionen)
-    zu eliminieren.
+    Ausgewogene Kalibrierung für lückenlose, organische Regenfronten ohne Überfilterung.
     """
     idx = np.zeros_like(val, dtype=np.uint8)
     
-    # 1. Rauschunterdrückung (Noise Gate):
-    # Alles <= 3 (entspricht < 0.36 mm/h bzw. < 7 dBZ) bleibt 0 (100% transparent).
+    # 1. Zarter Nieselregen & Feuchtesaum: val 1..4 (0.12..0.48 mm/h)
+    m1 = (val >= 1) & (val < 5)
+    idx[m1] = (1 + ((val[m1] - 1) / 4.0) * 24).astype(np.uint8)
     
-    # 2. Zarter Türkis-Nieselsaum: val 4..7 (0.48..0.84 mm/h)
-    m1 = (val >= 4) & (val < 8)
-    idx[m1] = (1 + ((val[m1] - 4) / 4.0) * 24).astype(np.uint8)
+    # 2. Leichter bis mäßiger Landregen (Sattes Smaragd- & Lime-Grün): val 5..20 (0.6..2.4 mm/h)
+    m2 = (val >= 5) & (val < 21)
+    idx[m2] = (26 + ((val[m2] - 5) / 16.0) * 64).astype(np.uint8)
     
-    # 3. Leichter bis mäßiger Landregen (Sattes Smaragd- & Lime-Grün): val 8..24 (0.96..2.88 mm/h)
-    m2 = (val >= 8) & (val < 25)
-    idx[m2] = (26 + ((val[m2] - 8) / 17.0) * 64).astype(np.uint8)
+    # 3. Kräftiger Schauer (Goldgelb): val 21..55 (2.5..6.6 mm/h)
+    m3 = (val >= 21) & (val < 56)
+    idx[m3] = (91 + ((val[m3] - 21) / 35.0) * 59).astype(np.uint8)
     
-    # 4. Kräftiger Regen (Goldgelb): val 25..60 (3.0..7.2 mm/h)
-    m3 = (val >= 25) & (val < 61)
-    idx[m3] = (91 + ((val[m3] - 25) / 36.0) * 59).astype(np.uint8)
+    # 4. Starkregen (Orange): val 56..140 (6.7..16.8 mm/h)
+    m4 = (val >= 56) & (val < 141)
+    idx[m4] = (151 + ((val[m4] - 56) / 85.0) * 49).astype(np.uint8)
     
-    # 5. Starkregen (Orange): val 61..150 (7.3..18.0 mm/h)
-    m4 = (val >= 61) & (val < 151)
-    idx[m4] = (151 + ((val[m4] - 61) / 90.0) * 49).astype(np.uint8)
+    # 5. Extremregen (Karminrot): val 141..280 (16.9..33.6 mm/h)
+    m5 = (val >= 141) & (val < 281)
+    idx[m5] = (201 + ((val[m5] - 141) / 140.0) * 34).astype(np.uint8)
     
-    # 6. Extremregen (Karminrot): val 151..300 (18.1..36.0 mm/h)
-    m5 = (val >= 151) & (val < 301)
-    idx[m5] = (201 + ((val[m5] - 151) / 150.0) * 34).astype(np.uint8)
-    
-    # 7. Unwetter / Hagel (Magenta/Weiß): val > 300 (>36.0 mm/h)
-    m6 = val > 300
-    idx[m6] = np.clip(236 + (val[m6] - 300) / 5.0, 236, 255).astype(np.uint8)
+    # 6. Unwetter / Hagel (Magenta/Weiß): val >= 281 (>33.6 mm/h)
+    m6 = val >= 281
+    idx[m6] = np.clip(236 + (val[m6] - 281) / 5.0, 236, 255).astype(np.uint8)
     
     return idx
 
@@ -157,12 +153,12 @@ def parse_radolan_binary(data_bytes):
     expected_16bit = width * height * 2
     if len(raw_data) >= expected_16bit:
         arr = np.frombuffer(raw_data[:expected_16bit], dtype=np.uint16).reshape((height, width))
-        # Maskiere Clutter/Fehlerbits (Bits 13, 14, 15)
-        is_nodata = (arr & 0xE000) > 0
+        # Maskiere echte No-Data / Sensorfehler (Bit 13)
+        is_nodata = (arr & 0x2000) > 0
         val = arr & 0x0FFF
         val[is_nodata] = 0
         
-        # Meteorologisch exakt auf 0..255 LUT mappen (inkl. Noise-Gate)
+        # Meteorologisch exakt auf 0..255 LUT mappen
         grid_indexed = map_radolan_val_to_index(val)
         
         # DWD RADOLAN invertieren (Nord oben)
@@ -240,12 +236,12 @@ def render_matrix_to_webp(grid_2d, output_path):
     rgba = TURBO_LUT[grid_2d]
     img = Image.fromarray(rgba, mode='RGBA')
     
-    # 1. Bilineare Skalierung für weiche, flüssige Isolinien
+    # 1. Bilineare Skalierung für weiche, lückenlose Fronten
     img_resized = img.resize((1400, 1400), Image.BILINEAR)
     
-    # 2. Konturenschärfung: Alpha unter 35 hart abschneiden (Filtert Geisterränder)
+    # 2. Feines Abschneiden nur von echtem Null-Alpha
     arr = np.array(img_resized)
-    arr[arr[:, :, 3] < 35, 3] = 0
+    arr[arr[:, :, 3] < 10, 3] = 0
     
     img_clean = Image.fromarray(arr, mode='RGBA')
     img_clean.save(output_path, 'WEBP', lossless=True, method=6)
