@@ -3,10 +3,10 @@
 DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (localwx PRO)
 ==========================================================================
 Erzeugt ein ultra-schnelles, 100% verlustfreies WebP-Niederschlagsradar
-mit der echten Google Turbo-Farbskala für die letzten 6 bis 8 Stunden (Historie)
-und 2 Stunden (Nowcast) direkt aus den rohen DWD RADOLAN-Rasterdaten.
+mit der Google Turbo-Farbskala für Historie und Nowcast direkt aus
+den DWD RADOLAN-Rasterdaten über Bright Sky.
 
-- 0% Hintergrund-Artefakte (überall 100% transparent wo es nicht regnet)
+- 0% Hintergrund-Artefakte (100% transparent bei Trockenheit)
 - Exakte Turbo-Farben passend zur Legende
 - 1400x1400 Pixel Lossless WebP
 - Automatischer FTPS-Upload zu netcup (/data/radar/)
@@ -28,7 +28,7 @@ import ftplib
 import ssl
 
 # ==============================================================================
-# ECHTE GOOGLE TURBO-FARBSKALA (256 RGBA NUMPY LOOKUP TABLE)
+# GOOGLE TURBO-FARBSKALA (256 RGBA NUMPY LOOKUP TABLE)
 # ==============================================================================
 
 def build_turbo_lut():
@@ -49,42 +49,36 @@ def build_turbo_lut():
 
     for i in range(1, 256):
         if i < 25:
-            # 1 - 24: Saphirblau bis Indigo (Nieselregen)
             t = (i - 1) / 24.0
             r = int(40 + t * 20)
             g = int(80 + t * 70)
             b = int(220 + t * 30)
             a = int(140 + t * 45)
         elif i < 65:
-            # 25 - 64: Cyan bis Türkis / Mint (0.5 - 2.5 mm)
             t = (i - 25) / 40.0
             r = int(20 + t * 15)
             g = int(190 + t * 35)
             b = int(235 - t * 25)
             a = int(185 + t * 35)
         elif i < 110:
-            # 65 - 109: Frisches Lime-Grün (2.5 - 5.0 mm)
             t = (i - 65) / 45.0
             r = int(50 + t * 140)
             g = int(225 + t * 25)
             b = int(80 - t * 40)
             a = int(220 + t * 25)
         elif i < 160:
-            # 110 - 159: Vivid Gold / Gelb (5.0 - 10 mm)
             t = (i - 110) / 50.0
             r = int(245 + t * 10)
             g = int(215 - t * 70)
             b = int(35 - t * 15)
             a = int(245 + t * 10)
         elif i < 210:
-            # 160 - 209: Leuchtendes Orange bis Knallrot (10 - 25 mm)
             t = (i - 160) / 50.0
             r = int(245 - t * 15)
             g = int(110 - t * 80)
             b = int(20 + t * 15)
             a = 255
         else:
-            # 210 - 255: Magenta bis Tiefviolett (Extremer Starkregen / Hagel)
             t = (i - 210) / 45.0
             r = int(210 - t * 70)
             g = int(30 - t * 15)
@@ -97,63 +91,51 @@ def build_turbo_lut():
 
 TURBO_LUT = build_turbo_lut()
 
-
-# Deutschland Bounding Box für RADOLAN
+# Fallback Bounding Box
 RADAR_BOUNDS = [[46.8, 5.5], [55.6, 15.8]]
 
 
 def generate_radar_dataset():
     start_time = time.time()
-    print("🚀 Starte DWD RADOLAN Turbo-Niederschlagsradar Generator (-8h bis +2h)...")
+    print("🚀 Starte DWD RADOLAN Turbo-Niederschlagsradar Generator...")
 
     output_dir = "./dist/radar"
     os.makedirs(output_dir, exist_ok=True)
 
     now = datetime.now(timezone.utc)
-    # 8 Stunden Vergangenheit bis 2 Stunden Nowcast
-    history_hours = 8
-    nowcast_hours = 2
+    # 4 Stunden Historie abrufen (Nowcast wird von Bright Sky automatisch angehängt)
+    history_hours = 4
     past_time = now - timedelta(hours=history_hours)
-    future_time = now + timedelta(hours=nowcast_hours)
+    date_str = past_time.strftime("%Y-%m-%dT%H:%M:00Z")
 
-    date_str = past_time.strftime("%Y-%m-%dT%H:00:00Z")
-    last_date_str = future_time.strftime("%Y-%m-%dT%H:00:00Z")
-
+    # Parameter: max distance = 300000m (300 km)
     params = urllib.parse.urlencode({
         'lat': '51.1657',
         'lon': '10.4515',
-        'distance': '500000',
+        'distance': '300000',
         'date': date_str,
-        'last_date': last_date_str,
         'format': 'plain'
     })
     url = f"https://api.brightsky.dev/radar?{params}"
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'localwx-RadarGenerator/2.0 (compatible; Mozilla/5.0)',
         'Accept': 'application/json'
     }
 
     data = None
     for attempt in range(3):
         try:
-            print(f"📡 Lade DWD RADOLAN-Daten (Versuch {attempt+1}/3): {date_str} bis {last_date_str}...")
+            print(f"📡 Lade DWD RADOLAN-Daten (Versuch {attempt+1}/3): ab {date_str}...")
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             if data and data.get('radar'):
                 print(f"✅ Erfolgreich {len(data['radar'])} DWD RADOLAN-Frames empfangen!")
                 break
         except urllib.error.HTTPError as he:
-            print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}) bei Anfrage. Versuche Fallback...")
-            params_fb = urllib.parse.urlencode({
-                'lat': '51.1657',
-                'lon': '10.4515',
-                'distance': '500000',
-                'date': date_str,
-                'format': 'plain'
-            })
-            url = f"https://api.brightsky.dev/radar?{params_fb}"
+            err_msg = he.read().decode('utf-8') if he.fp else ''
+            print(f"⚠️ HTTP-Fehler ({he.code} {he.reason}): {err_msg}")
             time.sleep(2)
         except Exception as e:
             print(f"⚠️ Verbindungsfehler: {e}")
@@ -164,7 +146,6 @@ def generate_radar_dataset():
         return
 
     frames_data = data.get('radar', [])
-
     print(f"📦 Verarbeite {len(frames_data)} DWD RADOLAN Raster-Frames mit Turbo-Farben...")
 
     # Bounding Box aus Geometrie ermitteln
@@ -194,20 +175,14 @@ def generate_radar_dataset():
         if not matrix or len(matrix) == 0:
             return None
 
-        # Rohe 2D-Matrix in NumPy Array umwandeln (0..255)
         grid = np.array(matrix, dtype=np.uint8)
-        
-        # Auf exakte Turbo LookUp-Table mappen (0 = 100% transparent!)
         rgba = TURBO_LUT[grid]
         img = Image.fromarray(rgba, mode='RGBA')
         
-        # Auf scharfe 1400x1400 Auflösung skalieren (NEAREST für gestochen scharfe Kanten)
         img_resized = img.resize((1400, 1400), Image.NEAREST)
 
         file_name = f"radar_{idx:03d}.webp"
         file_path = os.path.join(output_dir, file_name)
-        
-        # Als 100% verlustfreies WebP speichern (keine Kompressionsartefakte!)
         img_resized.save(file_path, 'WEBP', lossless=True, method=6)
 
         ts_str = item.get('timestamp')
@@ -238,14 +213,12 @@ def generate_radar_dataset():
 
     results.sort(key=lambda x: x['step'])
 
-    # Metadaten JSON schreiben
     metadata = {
         "model": "DWD RADOLAN HD",
         "parameter": "precipitation_radar",
         "title": "Turbo-Niederschlagsradar",
         "colormap": "google_turbo",
         "history_hours": history_hours,
-        "nowcast_hours": nowcast_hours,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bounds": valid_bounds,
         "frames": results
@@ -258,7 +231,6 @@ def generate_radar_dataset():
     duration = round(time.time() - start_time, 1)
     print(f"✨ Radar-Generierung erfolgreich: {len(results)} Turbo-Frames in {duration}s gerendert!")
 
-    # FTPS Upload
     upload_directory_to_ftp(output_dir, "radar")
 
 
@@ -288,7 +260,6 @@ def upload_directory_to_ftp(local_dir, remote_folder="radar"):
             print(f"❌ FTP-Verbindung fehlgeschlagen: {e}")
             return
 
-    # Zielordner /data/{remote_folder} erstellen & wechseln
     ftp.cwd('/')
     for folder in ["data", remote_folder]:
         try:
