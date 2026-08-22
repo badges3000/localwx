@@ -122,18 +122,23 @@ def generate_radar_dataset():
     params = urllib.parse.urlencode({
         'lat': '51.1657',
         'lon': '10.4515',
-        'distance': '850000',
+        'distance': '500000',
         'date': date_str,
         'last_date': last_date_str,
         'format': 'plain'
     })
     url = f"https://api.brightsky.dev/radar?{params}"
 
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    }
+
     data = None
     for attempt in range(3):
         try:
             print(f"📡 Lade DWD RADOLAN-Daten (Versuch {attempt+1}/3): {date_str} bis {last_date_str}...")
-            req = urllib.request.Request(url, headers={'User-Agent': 'localwx-TurboRadar-Generator/2.0'})
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
             if data and data.get('radar'):
@@ -144,7 +149,7 @@ def generate_radar_dataset():
             params_fb = urllib.parse.urlencode({
                 'lat': '51.1657',
                 'lon': '10.4515',
-                'distance': '850000',
+                'distance': '500000',
                 'date': date_str,
                 'format': 'plain'
             })
