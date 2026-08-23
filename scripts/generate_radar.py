@@ -6,7 +6,7 @@ Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt v
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
 - Exakte Polar-Stereographische Entzerrung (Warp auf EPSG:4326/Leaflet)
-- Messerscharfe, voll deckende Vektorkanten im DWD WarnWetter / Kachelmann Stil
+- Organische Isolinien-Glättung im DWD WarnWetter / Kachelmann Vektor-Stil
 - Nieselbrücken-Schutz via morphologischer Dilatation für lückenlose Regenfronten
 - Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
 - 100% verlustfreies WebP (lossless=True, method=6)
@@ -38,7 +38,7 @@ RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 def build_turbo_lut():
     """
     Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255)
-    im brillanten DWD WarnWetter / Kachelmann Kontrast-Stil mit 100% Deckkraft.
+    im brillanten DWD WarnWetter / Kachelmann Kontrast-Stil.
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
 
@@ -52,14 +52,15 @@ def build_turbo_lut():
             r = int(30 + t * 20)
             g = int(185 + t * 45)
             b = int(245 - t * 15)
-            a = 255  # 100% Opazität für gestochen scharfe Außenkanten
+            a = int(220 + t * 35)  # Knackige, saubere Kante mit vollem Kontrast
         elif i < 91:
             # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
+            # Bildet wie in der WarnWetter App die voll deckende Hauptmasse des Regens
             t = (i - 26) / 64.0
             r = int(45 + t * 125)
             g = int(218 + t * 25)
             b = int(70 - t * 55)
-            a = 255
+            a = 255  # 100% Opazität für maximalen Kontrast über Land & Meer
         elif i < 151:
             # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.52 - 6.60 mm/h)
             t = (i - 91) / 59.0
@@ -130,6 +131,7 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
 
     # Offset der linken unteren Ecke (SW) im 1100x1200 RADOLAN Raster
+    # DWD DE1200 Gitter: x_0 = -543.197 km, y_0 (South) = -4822.589 km
     x_px = x_proj + 543.197
     y_px = y_proj + 4822.589
 
@@ -139,29 +141,26 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 def reproject_and_smooth_radar(grid_1200x1100):
     """
-    Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326)
-    mit nativer bilinearer Interpolation ohne matschige Weichzeichner.
+    1. Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326).
+    2. Verwendet kubische Spline-Interpolation (order=3) für saubere, organische Konturen mit messerscharfen Rändern.
     """
     try:
         from scipy.ndimage import map_coordinates
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
         
-        # Reprojektion mit bilinearer Interpolation (order=1)
-        warped = map_coordinates(
-            grid_1200x1100.astype(np.float32),
-            [y_coords, x_coords],
-            order=1,
-            mode='constant',
-            cval=0.0
-        )
+        # Kubische Spline-Reprojektion (order=3): Perfekt glatte Kurven ohne Weichzeichner-Halo
+        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=3, mode='constant', cval=0.0)
         
+        # Scharfe Grenze für Niesel erhalten (kein künstlicher Dunstschleier)
+        warped[warped < 1.0] = 0
         return np.clip(warped, 0, 255).astype(np.uint8)
 
     except ImportError:
+        # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
-        return np.array(img.resize((1400, 1400), Image.BILINEAR))
+        return np.array(img.resize((1400, 1400), Image.BICUBIC))
 
 
 def remove_isolated_radar_clutter(val):
@@ -355,6 +354,9 @@ def render_matrix_to_webp(grid_reprojected_1400, output_path):
     """
     rgba = TURBO_LUT[grid_reprojected_1400]
     
+    # Dünne Rest-Transparenzen unter 10 säubern
+    rgba[rgba[:, :, 3] < 10, 3] = 0
+    
     img_clean = Image.fromarray(rgba, mode='RGBA')
     img_clean.save(output_path, 'WEBP', lossless=True, method=6)
 
@@ -505,7 +507,7 @@ def generate_radar_dataset():
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    print(f"🌐 Führe Polar-Stereographische Reprojektion durch...")
+    print(f"🌐 Führe Polar-Stereographische Reprojektion & Isolinien-Glättung durch...")
 
     # 2. Paralleles Reprojizieren und Rendern
     frames_metadata = []
@@ -514,7 +516,7 @@ def generate_radar_dataset():
         item = all_items[idx]
         grid = cleaned_grids[idx]
         
-        # Exakte Reprojektion von Polar-Stereo auf WGS84
+        # Exakte Reprojektion von Polar-Stereo auf WGS84 + Konturglättung
         warped_grid = reproject_and_smooth_radar(grid)
         
         file_name = f"radar_{idx:03d}.webp"
