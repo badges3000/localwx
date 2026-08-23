@@ -97,46 +97,37 @@ TURBO_LUT = build_turbo_lut()
 
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Cluster- & Flächenfilter (100% flackerfrei, kein Aufpoppen):
+    Meteorologischer Core-Requirement & Clutter Filter:
     
-    1. ECHTE Regenfelder & Nieselzonen:
-       Haben eine reale räumliche Ausdehnung (Fläche >= 20 Pixel).
-       Werden flackerfrei, kontinuierlich und ohne Sprünge dargestellt!
-       
-    2. ECHTER Schauerregen mit Kern:
-       Jedes Regengebiet mit mindestens einem Kernpixel val >= 4 wird immer dargestellt.
-       
-    3. ISOLIERTES Turmrauschen & Geister-Sprenkel:
-       Winzige isolierte Punkt-Cluster (< 20 Pixel) OHNE jeden Kern (val < 4).
-       Werden sauber und geräuschlos entfernt!
+    Echte Regenwolken besitzen immer mindestens einen Niederschlagskern
+    (val >= 5 bzw. > 0.6 mm/h / grüner Kern oder höher).
+    Der feine Niesel (val 1..4) an den Außenrändern dieser echten Wolken
+    wird vollständig und lückenlos erhalten!
+    
+    Cluster, die zu 100% NUR aus schwachem Rauschen (val 1..4) bestehen
+    und keinen einzigen Tropfen echten Regens im Inneren aufweisen,
+    sind physikalische Inversions- und Bodenechos (an den DWD-Radartürmen
+    Frankfurt, Hannover, Essen, Thüringen etc.) und werden restlos gelöscht!
     """
     if not np.any(val > 0):
         return val
-        
+
     try:
         from scipy.ndimage import label
-        
+
         labeled_array, num_features = label(val > 0)
         if num_features == 0:
             return val
-            
-        cluster_sizes = np.bincount(labeled_array.ravel())
+
         clean_val = val.copy()
-        
+
         for i in range(1, num_features + 1):
-            size = cluster_sizes[i]
-            # Große zusammenhängende Regenwolken (Fläche >= 20 Pixel) immer behalten
-            if size >= 20:
-                continue
-                
-            # Bei winzigen Mini-Clustern (< 20 Pixel):
-            # Nur behalten wenn ein echter Schauerkern vorhanden ist (val >= 4)
-            cluster_mask = (labeled_array == i)
-            if np.max(val[cluster_mask]) < 4:
-                clean_val[cluster_mask] = 0
-                
+            mask = (labeled_array == i)
+            # Wenn der Cluster keinen einzigen Pixel mit val >= 5 (echter Regen > 0.6 mm/h) hat:
+            if np.max(val[mask]) < 5:
+                clean_val[mask] = 0
+
         return clean_val
-        
     except ImportError:
         return val
 
