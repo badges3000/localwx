@@ -141,23 +141,17 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 def reproject_and_smooth_radar(grid_1200x1100):
     """
-    1. Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326).
-    2. Wendet organische Konturglättung (Isolinien-Filter) an.
+    Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326)
+    in voller nativer Schärfe ohne künstlichen Weichzeichner.
     """
     try:
-        from scipy.ndimage import map_coordinates, gaussian_filter
+        from scipy.ndimage import map_coordinates
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
         
-        # Reprojektion mit bilinearer Interpolation
+        # Exakte Reprojektion ohne Weichzeichner (100% scharf)
         warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
-        
-        # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
-        smoothed = gaussian_filter(warped, sigma=0.75)
-        
-        # Scharfe Grenze für Niesel erhalten
-        smoothed[warped == 0] = 0
-        return np.clip(smoothed, 0, 255).astype(np.uint8)
+        return np.clip(warped, 0, 255).astype(np.uint8)
 
     except ImportError:
         # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
