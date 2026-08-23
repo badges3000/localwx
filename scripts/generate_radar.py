@@ -296,6 +296,46 @@ def render_matrix_to_webp(grid_2d, output_path):
     img_clean.save(output_path, 'WEBP', lossless=True, method=6)
 
 
+def apply_temporal_consistency_filter(grid_list):
+    """
+    Temporaler Konsistenz-Filter (Anti-Flicker & Anti-Pop):
+    Untersucht die Sequenz (t-1, t, t+1).
+    Isolierte Sprenkel & Spikes (val <= 3), die nur für exakt einen 5-Minuten-Frame
+    im Nichts aufblitzen, werden eliminiert.
+    Wandernde Fronten und zusammenhängende Regengebiete bleiben zu 100% erhalten.
+    """
+    n = len(grid_list)
+    if n < 3:
+        return grid_list
+
+    try:
+        from scipy.ndimage import maximum_filter
+        cleaned_list = [grid_list[0].copy()]
+
+        for t in range(1, n - 1):
+            prev_g = grid_list[t - 1]
+            curr_g = grid_list[t]
+            next_g = grid_list[t + 1]
+
+            # Finde Gebiete mit Niederschlag in t-1 und t+1 (~5km Suchradius)
+            prev_active = maximum_filter(prev_g > 0, size=7)
+            next_active = maximum_filter(next_g > 0, size=7)
+            temporal_support = prev_active | next_active
+
+            # Schwache Pixel (val <= 3) ohne zeitlichen Halt in t-1 oder t+1 sind temporäre Glitches
+            is_glitch = (curr_g > 0) & (curr_g <= 3) & (~temporal_support)
+
+            curr_clean = curr_g.copy()
+            curr_clean[is_glitch] = 0
+            cleaned_list.append(curr_clean)
+
+        cleaned_list.append(grid_list[-1].copy())
+        return cleaned_list
+    except Exception as e:
+        print(f"Hinweis beim Temporal-Filter: {e}")
+        return grid_list
+
+
 def generate_radar_dataset():
     start_time = time.time()
     print("🚀 Starte DWD RADOLAN HD 5-Minuten Turbo-Radar Generator (100% DWD OpenData)...")
@@ -318,16 +358,15 @@ def generate_radar_dataset():
 
     print(f"📦 Lade {len(selected_history)} lückenlose 5-Minuten-Messungen (-8h bis Jetzt)...")
 
-    frames_metadata = []
+    raw_history_items = []
 
-    # 3. Historie parallel herunterladen und rendern
+    # 3. Historie parallel herunterladen und parsen
     def process_history_item(item, idx):
         filename, valid_dt = item
         data_dict = download_and_extract_tar_bz2(filename)
         if not data_dict:
             return None
 
-        # Der Frame '_000' ist die tatsächliche Messung
         main_key = next((k for k in sorted(data_dict.keys()) if '_000' in k or k.endswith('000')), None)
         if not main_key:
             main_key = sorted(data_dict.keys())[0]
@@ -337,14 +376,9 @@ def generate_radar_dataset():
         if grid is None:
             return None
 
-        file_name = f"radar_{idx:03d}.webp"
-        file_path = os.path.join(output_dir, file_name)
-        render_matrix_to_webp(grid, file_path)
-
         return {
-            "step": idx,
-            "valid_time": valid_dt.strftime("%Y-%m-%dT%H:%M:00Z"),
-            "file": file_name,
+            "valid_dt": valid_dt,
+            "grid": grid,
             "is_nowcast": False
         }
 
@@ -353,33 +387,19 @@ def generate_radar_dataset():
         for future in as_completed(futures):
             res = future.result()
             if res:
-                frames_metadata.append(res)
+                raw_history_items.append(res)
 
-    frames_metadata.sort(key=lambda x: x['valid_time'])
-
-    # Indizes der Historie sauber durchnummerieren
-    for i, f in enumerate(frames_metadata):
-        f['step'] = i
-        old_name = f['file']
-        new_name = f"radar_{i:03d}.webp"
-        if old_name != new_name:
-            old_p = os.path.join(output_dir, old_name)
-            new_p = os.path.join(output_dir, new_name)
-            if os.path.exists(old_p):
-                os.rename(old_p, new_p)
-            f['file'] = new_name
-
-    frame_idx = len(frames_metadata)
-    print(f"✅ {frame_idx} historische 5-Minuten-Frames erfolgreich generiert.")
+    raw_history_items.sort(key=lambda x: x['valid_dt'])
+    print(f"✅ {len(raw_history_items)} historische 5-Minuten-Grids geladen.")
 
     # 4. Nowcast (+2h Zukunft im lückenlosen 5-Minuten-Takt)
+    raw_nowcast_items = []
     latest_file = dwd_files[-1][0]
     latest_dt = dwd_files[-1][1]
     print(f"🔮 Lade DWD 5-Minuten Nowcast (+2h) aus neuester Datei: {latest_file}...")
 
     nowcast_data = download_and_extract_tar_bz2(latest_file)
     if nowcast_data:
-        # Sortiere Nowcast-Schritte (_005, _010, _015, _020 ... _120)
         nowcast_keys = [k for k in sorted(nowcast_data.keys()) if not k.endswith('_000')]
         selected_nowcast_keys = []
         for k in nowcast_keys:
@@ -395,21 +415,48 @@ def generate_radar_dataset():
             header, grid = parse_radolan_binary(file_bytes)
             if grid is not None:
                 valid_dt = latest_dt + timedelta(minutes=minutes)
-                file_name = f"radar_{frame_idx:03d}.webp"
-                file_path = os.path.join(output_dir, file_name)
-                render_matrix_to_webp(grid, file_path)
-
-                frames_metadata.append({
-                    "step": frame_idx,
-                    "valid_time": valid_dt.strftime("%Y-%m-%dT%H:%M:00Z"),
-                    "file": file_name,
+                raw_nowcast_items.append({
+                    "valid_dt": valid_dt,
+                    "grid": grid,
                     "is_nowcast": True
                 })
-                frame_idx += 1
 
-    print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig!")
+    all_items = raw_history_items + raw_nowcast_items
+    all_items.sort(key=lambda x: x['valid_dt'])
+    print(f"🧠 Wende 3-Stufen Temporal & Spatial Anti-Pop Filter auf alle {len(all_items)} Frames an...")
 
-    # 5. Metadata JSON schreiben
+    # 5. Temporal Consistency Filter über die gesamte chronologische Sequenz
+    raw_grids = [item['grid'] for item in all_items]
+    cleaned_grids = apply_temporal_consistency_filter(raw_grids)
+
+    # 6. Paralleles Rendern aller WebP-Dateien
+    frames_metadata = []
+
+    def render_and_save(idx):
+        item = all_items[idx]
+        grid = cleaned_grids[idx]
+        file_name = f"radar_{idx:03d}.webp"
+        file_path = os.path.join(output_dir, file_name)
+        render_matrix_to_webp(grid, file_path)
+
+        return {
+            "step": idx,
+            "valid_time": item['valid_dt'].strftime("%Y-%m-%dT%H:%M:00Z"),
+            "file": file_name,
+            "is_nowcast": item['is_nowcast']
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(render_and_save, i): i for i in range(len(all_items))}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                frames_metadata.append(res)
+
+    frames_metadata.sort(key=lambda x: x['step'])
+    print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
+
+    # 7. Metadata JSON schreiben
     metadata = {
         "model": "DWD RADOLAN HD",
         "parameter": "precipitation_radar",
