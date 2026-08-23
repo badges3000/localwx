@@ -5,8 +5,9 @@ DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
 Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
-- Meteorologisch kalibrierte Google Turbo Farbtabelle (WarnWetter-Dynamik mit sattem Grün, Gelb, Orange, Rot)
-- Konturenscharfe bikubische Kantenglättung ohne verwaschene Ränder
+- Bereinigung von Inversions-Bodenclutter & Sensorfehlern via Hysterese & Flächenfilter
+- Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
+- Meteorologisch kalibrierte Google Turbo Farbtabelle (WarnWetter-Dynamik)
 - 100% verlustfreies WebP (lossless=True, method=6)
 - Erzeugt meta.json und lädt per FTPS nach /data/radar/ hoch.
 """
@@ -35,8 +36,7 @@ RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 
 def build_turbo_lut():
     """
-    Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255)
-    Exakt abgestimmt auf das visuelle Erscheinungsbild der DWD WarnWetter App.
+    Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255).
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
 
@@ -45,43 +45,42 @@ def build_turbo_lut():
             # 0: Absolut transparent (Kein Niederschlag)
             r, g, b, a = 0, 0, 0, 0
         elif i < 26:
-            # 1 - 25: Zarter Türkis / Cyan Außensaum (0.05 - 0.35 mm/h / < 15 dBZ)
+            # 1 - 25: Zarter Türkis / Cyan Außensaum (0.24 - 0.60 mm/h)
             t = (i - 1) / 24.0
             r = int(35 + t * 20)
             g = int(180 + t * 45)
             b = int(245 - t * 20)
             a = int(160 + t * 50)
         elif i < 91:
-            # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.35 - 2.5 mm/h / 15 - 30 dBZ)
-            # Bildet wie in der WarnWetter App die großflächige Hauptmasse des Regens
+            # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
             t = (i - 26) / 64.0
             r = int(35 + t * 115)
             g = int(215 + t * 25)
             b = int(120 - t * 105)
             a = int(220 + t * 25)
         elif i < 151:
-            # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.5 - 7.0 mm/h / 30 - 40 dBZ)
+            # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.52 - 6.60 mm/h)
             t = (i - 91) / 59.0
             r = int(235 + t * 20)
             g = int(210 - t * 50)
             b = int(20 - t * 10)
             a = 250
         elif i < 201:
-            # 151 - 200: Kräftiges Orange (7.0 - 18.0 mm/h / 40 - 48 dBZ)
+            # 151 - 200: Kräftiges Orange (6.72 - 16.8 mm/h)
             t = (i - 151) / 49.0
             r = int(245 - t * 10)
             g = int(140 - t * 75)
             b = int(15 + t * 10)
             a = 255
         elif i < 236:
-            # 201 - 235: Intensives Karminrot bis Scharlachrot (18.0 - 35.0 mm/h / 48 - 55 dBZ)
+            # 201 - 235: Intensives Karminrot bis Scharlachrot (16.9 - 33.6 mm/h)
             t = (i - 201) / 34.0
             r = int(235 - t * 25)
             g = int(45 - t * 25)
             b = int(25 + t * 65)
             a = 255
         else:
-            # 236 - 255: Magenta bis Weiß-Violett (Extremer Starkregen / Hagel > 35 mm/h / > 55 dBZ)
+            # 236 - 255: Magenta bis Weiß-Violett (Extremer Starkregen / Hagel > 33.6 mm/h)
             t = (i - 236) / 19.0
             r = int(210 + t * 45)
             g = int(30 + t * 220)
@@ -119,7 +118,6 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        # Ein Cluster ist NUR DANN Clutter, wenn er klein ist (< 150 Pixel) UND keinen Schauerkern (val >= 4) hat
         is_clutter_cluster = (cluster_sizes < 150) & (cluster_maxs < 4)
         invalid_cluster_ids = indices[is_clutter_cluster]
 
@@ -135,35 +133,34 @@ def remove_isolated_radar_clutter(val):
 
 def map_radolan_val_to_index(val):
     """
-    Mappt DWD RADOLAN RV Rohwerte (0.01 mm/5min) physikalisch exakt auf die 256 Turbo-Farbstufen.
-    Ausgewogene Kalibrierung für lückenlose, organische Regenfronten ohne Überfilterung.
+    Mappt DWD RADOLAN RV Rohwerte (0.01 mm/5min) auf 256 Turbo-Farbstufen.
     """
     idx = np.zeros_like(val, dtype=np.uint8)
-    
-    # 1. Zarter Nieselregen & Feuchtesaum: val 1..4 (0.12..0.48 mm/h)
-    m1 = (val >= 1) & (val < 5)
-    idx[m1] = (1 + ((val[m1] - 1) / 4.0) * 24).astype(np.uint8)
-    
-    # 2. Leichter bis mäßiger Landregen (Sattes Smaragd- & Lime-Grün): val 5..20 (0.6..2.4 mm/h)
-    m2 = (val >= 5) & (val < 21)
-    idx[m2] = (26 + ((val[m2] - 5) / 16.0) * 64).astype(np.uint8)
-    
-    # 3. Kräftiger Schauer (Goldgelb): val 21..55 (2.5..6.6 mm/h)
+
+    # 1. Zarter Nieselregen & Feuchtesaum (val 2..5 -> 0.24..0.60 mm/h)
+    m1 = (val >= 2) & (val < 6)
+    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
+
+    # 2. Leichter bis mäßiger Landregen (val 6..20 -> 0.72..2.40 mm/h)
+    m2 = (val >= 6) & (val < 21)
+    idx[m2] = (26 + ((val[m2] - 6) / 15.0) * 64).astype(np.uint8)
+
+    # 3. Kräftiger Schauer (val 21..55 -> 2.52..6.60 mm/h)
     m3 = (val >= 21) & (val < 56)
     idx[m3] = (91 + ((val[m3] - 21) / 35.0) * 59).astype(np.uint8)
-    
-    # 4. Starkregen (Orange): val 56..140 (6.7..16.8 mm/h)
+
+    # 4. Starkregen (val 56..140 -> 6.72..16.8 mm/h)
     m4 = (val >= 56) & (val < 141)
     idx[m4] = (151 + ((val[m4] - 56) / 85.0) * 49).astype(np.uint8)
-    
-    # 5. Extremregen (Karminrot): val 141..280 (16.9..33.6 mm/h)
+
+    # 5. Extremregen (val 141..280 -> 16.9..33.6 mm/h)
     m5 = (val >= 141) & (val < 281)
     idx[m5] = (201 + ((val[m5] - 141) / 140.0) * 34).astype(np.uint8)
-    
-    # 6. Unwetter / Hagel (Magenta/Weiß): val >= 281 (>33.6 mm/h)
+
+    # 6. Unwetter / Hagel (val >= 281 -> >33.6 mm/h)
     m6 = val >= 281
     idx[m6] = np.clip(236 + (val[m6] - 281) / 5.0, 236, 255).astype(np.uint8)
-    
+
     return idx
 
 
@@ -191,17 +188,21 @@ def parse_radolan_binary(data_bytes):
     expected_16bit = width * height * 2
     if len(raw_data) >= expected_16bit:
         arr = np.frombuffer(raw_data[:expected_16bit], dtype=np.uint16).reshape((height, width))
-        # Maskiere echte No-Data / Sensorfehler (Bit 13)
-        is_nodata = (arr & 0x2000) > 0
+        
+        # Maskiere Fehlkennung (Bit 14) und Sensorfehler (Bit 13)
+        is_nodata = (arr & 0x6000) > 0
         val = arr & 0x0FFF
         val[is_nodata] = 0
         
-        # Meteorologischer Kontextfilter: Entfernt isolierte Turmechos, schützt echte Fronten
+        # Thermischen Antennen-Rauschboden (< 0.24 mm/h) auf 0 setzen
+        val[val < 2] = 0
+
+        # Meteorologischer Hysterese- & Flächenfilter
         val = remove_isolated_radar_clutter(val)
-        
+
         # Meteorologisch exakt auf 0..255 LUT mappen
         grid_indexed = map_radolan_val_to_index(val)
-        
+
         # DWD RADOLAN invertieren (Nord oben)
         grid_indexed = np.flipud(grid_indexed)
         return header, grid_indexed
@@ -277,10 +278,8 @@ def render_matrix_to_webp(grid_2d, output_path):
     rgba = TURBO_LUT[grid_2d]
     img = Image.fromarray(rgba, mode='RGBA')
     
-    # 1. Bilineare Skalierung für weiche, lückenlose Fronten
     img_resized = img.resize((1400, 1400), Image.BILINEAR)
     
-    # 2. Feines Abschneiden nur von echtem Null-Alpha
     arr = np.array(img_resized)
     arr[arr[:, :, 3] < 10, 3] = 0
     
@@ -293,8 +292,9 @@ def apply_temporal_consistency_filter(grid_list):
     Bidirektionaler temporaler Konsistenz-Filter (Anti-Flicker, Anti-Pop & Gap-Filling):
     
     1. Heilt 'Dips': Wenn ein Regengebiet in t-1 und t+1 existiert, aber in t kurzzeitig unter
-       die Messschwelle sinkt -> interpolieren (verhindert das Flackern/Wegploppen).
-    2. Entfernt 'Spikes': Wenn ein schwacher Pixel nur für exakt 1 Frame isoliert aufblitzt -> löschen.
+       die Messschwelle sinkt -> interpolieren (verhindert Flackern/Wegploppen).
+    2. Entfernt 'Spikes': Wenn ein schwacher Farbindex (1..25, entspricht Niesel < 0.6 mm/h)
+       nur für exakt 1 Frame isoliert aufblitzt -> löschen.
     """
     n = len(grid_list)
     if n < 3:
@@ -311,24 +311,31 @@ def apply_temporal_consistency_filter(grid_list):
 
             curr_clean = curr_g.copy()
 
-            # 1. Gap-Filling (Dips heilen):
-            # Wenn in t-1 und t+1 am selben Ort Niederschlag war, aber in t kurz 0 ist -> Mittelwert einsetzen!
+            # 1. Gap-Filling (Dips heilen)
             is_dip = (curr_clean == 0) & (prev_g > 0) & (next_g > 0)
             if np.any(is_dip):
-                curr_clean[is_dip] = np.maximum(1, (prev_g[is_dip].astype(np.int32) + next_g[is_dip].astype(np.int32)) // 2).astype(np.uint16)
+                interpolated = (prev_g[is_dip].astype(np.int32) + next_g[is_dip].astype(np.int32)) // 2
+                curr_clean[is_dip] = np.maximum(1, interpolated).astype(np.uint8)
 
-            # 2. Spike-Removal (Popups entfernen):
+            # 2. Spike-Removal (Isolierte Flicker-Pixel entfernen)
             prev_active = maximum_filter(prev_g > 0, size=7)
             next_active = maximum_filter(next_g > 0, size=7)
             temporal_support = prev_active | next_active
 
-            # Schwache Pixel (val <= 3) ohne zeitlichen Halt in t-1 oder t+1 sind temporäre Glitches
-            is_spike = (curr_clean > 0) & (curr_clean <= 3) & (~temporal_support)
+            # Indizes 1..25 entsprechen Niesel/Feuchtesaum
+            is_spike = (curr_clean > 0) & (curr_clean <= 25) & (~temporal_support)
             curr_clean[is_spike] = 0
 
             cleaned_list.append(curr_clean)
 
-        cleaned_list.append(grid_list[-1].copy())
+        # Letzter Frame: Einseitige Prüfung gegen t-1
+        last_g = grid_list[-1]
+        prev_active = maximum_filter(grid_list[-2] > 0, size=7)
+        is_last_spike = (last_g > 0) & (last_g <= 25) & (~prev_active)
+        last_clean = last_g.copy()
+        last_clean[is_last_spike] = 0
+        cleaned_list.append(last_clean)
+
         return cleaned_list
     except Exception as e:
         print(f"Hinweis beim Temporal-Filter: {e}")
@@ -342,7 +349,6 @@ def generate_radar_dataset():
     output_dir = "./dist/radar"
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Verfügbare DWD OpenData RV Dateien abrufen
     dwd_files = get_available_dwd_rv_files()
     if not dwd_files:
         print("❌ Keine RADOLAN-Dateien auf opendata.dwd.de gefunden!")
@@ -351,7 +357,7 @@ def generate_radar_dataset():
     now = datetime.now(timezone.utc)
     print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} RADOLAN RV Komposite verfügbar).")
 
-    # 2. Historie filtern: Letzte 8 Stunden (Lückenloser 5-Minuten-Takt!)
+    # Letzte 8 Stunden Historie
     eight_hours_ago = now - timedelta(hours=8)
     selected_history = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now]
 
@@ -359,7 +365,6 @@ def generate_radar_dataset():
 
     raw_history_items = []
 
-    # 3. Historie parallel herunterladen und parsen
     def process_history_item(item, idx):
         filename, valid_dt = item
         data_dict = download_and_extract_tar_bz2(filename)
@@ -391,7 +396,7 @@ def generate_radar_dataset():
     raw_history_items.sort(key=lambda x: x['valid_dt'])
     print(f"✅ {len(raw_history_items)} historische 5-Minuten-Grids geladen.")
 
-    # 4. Nowcast (+2h Zukunft im lückenlosen 5-Minuten-Takt)
+    # Nowcast (+2h)
     raw_nowcast_items = []
     latest_file = dwd_files[-1][0]
     latest_dt = dwd_files[-1][1]
@@ -424,11 +429,11 @@ def generate_radar_dataset():
     all_items.sort(key=lambda x: x['valid_dt'])
     print(f"🧠 Wende 3-Stufen Temporal & Spatial Anti-Pop Filter auf alle {len(all_items)} Frames an...")
 
-    # 5. Temporal Consistency Filter über die gesamte chronologische Sequenz
+    # Temporal Consistency Filter
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    # 6. Paralleles Rendern aller WebP-Dateien
+    # Paralleles Rendern
     frames_metadata = []
 
     def render_and_save(idx):
@@ -455,7 +460,6 @@ def generate_radar_dataset():
     frames_metadata.sort(key=lambda x: x['step'])
     print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
 
-    # 7. Metadata JSON schreiben
     metadata = {
         "model": "DWD RADOLAN HD",
         "parameter": "precipitation_radar",
@@ -473,7 +477,6 @@ def generate_radar_dataset():
     duration = round(time.time() - start_time, 1)
     print(f"🎉 Radar-Generierung in {duration}s abgeschlossen!")
 
-    # 6. FTPS Upload
     upload_directory_to_ftp(output_dir, "radar")
 
 
