@@ -5,9 +5,10 @@ DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
 Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
-- Bereinigung von Inversions-Bodenclutter & Sensorfehlern via Hysterese & Flächenfilter
+- Exakte Polar-Stereographische Entzerrung (Warp auf EPSG:4326/Leaflet)
+- Organische Isolinien-Glättung im DWD WarnWetter / Kachelmann Vektor-Stil
+- Nieselbrücken-Schutz via morphologischer Dilatation für lückenlose Regenfronten
 - Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
-- Meteorologisch kalibrierte Google Turbo Farbtabelle (WarnWetter-Dynamik)
 - 100% verlustfreies WebP (lossless=True, method=6)
 - Erzeugt meta.json und lädt per FTPS nach /data/radar/ hoch.
 """
@@ -29,14 +30,15 @@ from PIL import Image
 import ftplib
 import ssl
 
-# Exakte DWD RADOLAN DE1200 Bounding Box (1100x1200 Polar-Stereographic Grid)
+# Exakte DWD RADOLAN DE1200 Bounding Box (Zielgitter 1400x1400)
 # SW: [45.68°N, 1.46°E] bis NE: [55.86°N, 18.73°E]
 RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 
 
 def build_turbo_lut():
     """
-    Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255).
+    Erstellt die meteorologisch kalibrierte Google Turbo LookUp-Table (0..255)
+    im brillanten DWD WarnWetter / Kachelmann Kontrast-Stil.
     """
     lut = np.zeros((256, 4), dtype=np.uint8)
 
@@ -47,44 +49,45 @@ def build_turbo_lut():
         elif i < 26:
             # 1 - 25: Zarter Türkis / Cyan Außensaum (0.24 - 0.60 mm/h)
             t = (i - 1) / 24.0
-            r = int(35 + t * 20)
-            g = int(180 + t * 45)
-            b = int(245 - t * 20)
-            a = int(160 + t * 50)
+            r = int(30 + t * 20)
+            g = int(185 + t * 45)
+            b = int(245 - t * 15)
+            a = int(170 + t * 65)  # Scharfe, saubere Kante ohne trüben Dunst
         elif i < 91:
             # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
+            # Bildet wie in der WarnWetter App die voll deckende Hauptmasse des Regens
             t = (i - 26) / 64.0
-            r = int(35 + t * 115)
-            g = int(215 + t * 25)
-            b = int(120 - t * 105)
-            a = int(220 + t * 25)
+            r = int(45 + t * 125)
+            g = int(218 + t * 25)
+            b = int(70 - t * 55)
+            a = 255  # 100% Opazität für maximalen Kontrast über Land & Meer
         elif i < 151:
             # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.52 - 6.60 mm/h)
             t = (i - 91) / 59.0
-            r = int(235 + t * 20)
-            g = int(210 - t * 50)
-            b = int(20 - t * 10)
-            a = 250
+            r = int(240 + t * 15)
+            g = int(215 - t * 45)
+            b = int(15 - t * 10)
+            a = 255
         elif i < 201:
             # 151 - 200: Kräftiges Orange (6.72 - 16.8 mm/h)
             t = (i - 151) / 49.0
-            r = int(245 - t * 10)
-            g = int(140 - t * 75)
-            b = int(15 + t * 10)
+            r = int(250 - t * 10)
+            g = int(145 - t * 75)
+            b = int(10 + t * 10)
             a = 255
         elif i < 236:
             # 201 - 235: Intensives Karminrot bis Scharlachrot (16.9 - 33.6 mm/h)
             t = (i - 201) / 34.0
-            r = int(235 - t * 25)
-            g = int(45 - t * 25)
+            r = int(238 - t * 25)
+            g = int(40 - t * 25)
             b = int(25 + t * 65)
             a = 255
         else:
             # 236 - 255: Magenta bis Weiß-Violett (Extremer Starkregen / Hagel > 33.6 mm/h)
             t = (i - 236) / 19.0
-            r = int(210 + t * 45)
-            g = int(30 + t * 220)
-            b = int(210 + t * 45)
+            r = int(215 + t * 40)
+            g = int(35 + t * 220)
+            b = int(215 + t * 40)
             a = 255
             
         lut[i] = [r, g, b, a]
@@ -94,21 +97,89 @@ def build_turbo_lut():
 TURBO_LUT = build_turbo_lut()
 
 
+# Vorberechnete Reprojektions-Koordinaten für das 1400x1400 WGS84 Zielraster
+_WARP_COORDS = None
+
+def get_reprojection_coords(target_h=1400, target_w=1400):
+    """
+    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> WGS84).
+    Wird einmalig vorberechnet und für alle 120 Frames wiederverwendet.
+    """
+    global _WARP_COORDS
+    if _WARP_COORDS is not None:
+        return _WARP_COORDS
+
+    lat_min, lat_max = RADAR_BOUNDS[0][0], RADAR_BOUNDS[1][0]
+    lon_min, lon_max = RADAR_BOUNDS[0][1], RADAR_BOUNDS[1][1]
+
+    # DWD Spezifikation: Polar-stereographische Projektion
+    R = 6370.040  # Erdradius in km
+    lat_ts = np.radians(60.0)  # Standard-Parallele 60°N
+    lon_0 = np.radians(10.0)   # Zentralmeridian 10°E
+    scale = R * (1.0 + np.sin(lat_ts))
+
+    # Reguläres Lat/Lon Gitter für Leaflet WebMap (von Nord nach Süd)
+    lats = np.linspace(lat_max, lat_min, target_h)
+    lons = np.linspace(lon_min, lon_max, target_w)
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+
+    phi = np.radians(lat_grid)
+    lam = np.radians(lon_grid)
+
+    m = scale / (1.0 + np.sin(phi))
+    x_proj = m * np.cos(phi) * np.sin(lam - lon_0)
+    y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
+
+    # Offset der linken unteren Ecke (SW) im 1100x1200 RADOLAN Raster
+    # DWD DE1200 Gitter: x_0 = -543.197 km, y_0 (South) = -4822.589 km
+    x_px = x_proj + 543.197
+    y_px = y_proj + 4822.589
+
+    _WARP_COORDS = (y_px, x_px)
+    return _WARP_COORDS
+
+
+def reproject_and_smooth_radar(grid_1200x1100):
+    """
+    1. Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326).
+    2. Wendet organische Konturglättung (Isolinien-Filter) an.
+    """
+    try:
+        from scipy.ndimage import map_coordinates, gaussian_filter
+
+        y_coords, x_coords = get_reprojection_coords(1400, 1400)
+        
+        # Reprojektion mit bilinearer Interpolation
+        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
+        
+        # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
+        smoothed = gaussian_filter(warped, sigma=0.75)
+        
+        # Scharfe Grenze für Niesel erhalten
+        smoothed[warped == 0] = 0
+        return np.clip(smoothed, 0, 255).astype(np.uint8)
+
+    except ImportError:
+        # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
+        flipped = np.flipud(grid_1200x1100)
+        img = Image.fromarray(flipped)
+        return np.array(img.resize((1400, 1400), Image.BILINEAR))
+
+
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Hysterese- & Flächenfilter:
+    Meteorologischer Nieselbrücken- & Flächenfilter:
 
-    1. Große Fronten (>= 150 Pixel / ~30 km²) bleiben IMMER erhalten.
-       Verhindert das Wegploppen und Flickern bei abziehendem/abschwächendem Nieselregen.
-    2. Kleinere Schauerzellen (< 150 Pixel) bleiben nur erhalten, wenn sie einen echten
-       Schauerkern (val >= 4 bzw. > 0.48 mm/h) besitzen.
-    3. Isolierte Mini-Echos (Turm-Clutter mit < 150 Pixeln und val < 4) werden restlos gelöscht.
+    1. Echte Kerne (val >= 4 bzw. > 0.48 mm/h) und große Fronten (>= 150 Pixel) definieren Regenfronten.
+    2. Nieselbrücken-Schutz: Durch morphologische Dilatation werden kleinere Nieselinseln im Umkreis
+       von 15 km um echte Fronten geschützt und nicht gelöscht.
+    3. Nur isolierter Turm-Clutter (< 150 Pixel, ohne Kern und ohne räumlichen Frontenbezug) wird entfernt.
     """
     if not np.any(val > 0):
         return val
 
     try:
-        from scipy.ndimage import label, maximum as nd_max, sum as nd_sum
+        from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
         labeled_array, num_features = label(val > 0)
         if num_features == 0:
@@ -118,8 +189,21 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        is_clutter_cluster = (cluster_sizes < 150) & (cluster_maxs < 4)
-        invalid_cluster_ids = indices[is_clutter_cluster]
+        # 1. Sichere Regenfronten: Haben einen Schauerkern (val >= 4) ODER sind groß (>= 150 Pixel)
+        is_core_or_large = (cluster_maxs >= 4) | (cluster_sizes >= 150)
+        valid_ids = indices[is_core_or_large]
+
+        # 2. Maske der sicheren Fronten erstellen
+        valid_mask = np.isin(labeled_array, valid_ids)
+
+        # 3. Nieselbrücken-Schutz: Dehne die Zone um 15 Pixel (~15 km) aus
+        expanded_zone = binary_dilation(valid_mask, iterations=15)
+
+        # 4. Prüfe Überlappung jedes Clusters mit der erweiterten Zone
+        overlap = nd_sum(expanded_zone.astype(int), labels=labeled_array, index=indices)
+        is_valid_cluster = is_core_or_large | (overlap > 0)
+
+        invalid_cluster_ids = indices[~is_valid_cluster]
 
         clean_val = val.copy()
         if len(invalid_cluster_ids) > 0:
@@ -167,7 +251,7 @@ def map_radolan_val_to_index(val):
 def parse_radolan_binary(data_bytes):
     """
     Parst ein binäres DWD RADOLAN-Kompositfile (RV, WN, SF, RW).
-    Gibt (header_str, 2D-numpy-array) mit gemappten Indizes zurück.
+    Gibt (header_str, 2D-numpy-array in Roh-Orientierung) zurück.
     """
     etx_pos = data_bytes.find(b'\x03')
     if etx_pos == -1:
@@ -197,19 +281,16 @@ def parse_radolan_binary(data_bytes):
         # Thermischen Antennen-Rauschboden (< 0.24 mm/h) auf 0 setzen
         val[val < 2] = 0
 
-        # Meteorologischer Hysterese- & Flächenfilter
+        # Meteorologischer Nieselbrücken- & Flächenfilter
         val = remove_isolated_radar_clutter(val)
 
         # Meteorologisch exakt auf 0..255 LUT mappen
         grid_indexed = map_radolan_val_to_index(val)
 
-        # DWD RADOLAN invertieren (Nord oben)
-        grid_indexed = np.flipud(grid_indexed)
         return header, grid_indexed
 
     elif len(raw_data) >= width * height:
         arr = np.frombuffer(raw_data[:width * height], dtype=np.uint8).reshape((height, width))
-        arr = np.flipud(arr)
         return header, arr
 
     return None, None
@@ -270,20 +351,16 @@ def download_and_extract_tar_bz2(filename):
         return {}
 
 
-def render_matrix_to_webp(grid_2d, output_path):
+def render_matrix_to_webp(grid_reprojected_1400, output_path):
     """
-    Wendet die WarnWetter-Turbo LUT an, glättet die Isolinien konturenscharf
-    und speichert als 100% verlustfreies WebP.
+    Wendet die WarnWetter-Turbo LUT an und speichert als 100% verlustfreies WebP.
     """
-    rgba = TURBO_LUT[grid_2d]
-    img = Image.fromarray(rgba, mode='RGBA')
+    rgba = TURBO_LUT[grid_reprojected_1400]
     
-    img_resized = img.resize((1400, 1400), Image.BILINEAR)
+    # Dünne Rest-Transparenzen unter 10 säubern
+    rgba[rgba[:, :, 3] < 10, 3] = 0
     
-    arr = np.array(img_resized)
-    arr[arr[:, :, 3] < 10, 3] = 0
-    
-    img_clean = Image.fromarray(arr, mode='RGBA')
+    img_clean = Image.fromarray(rgba, mode='RGBA')
     img_clean.save(output_path, 'WEBP', lossless=True, method=6)
 
 
@@ -322,7 +399,7 @@ def apply_temporal_consistency_filter(grid_list):
             next_active = maximum_filter(next_g > 0, size=7)
             temporal_support = prev_active | next_active
 
-            # Indizes 1..25 entsprechen Niesel/Feuchtesaum
+            # Indizes 1..25 entsprechen Niesel/Feuchtesaum (< 0.6 mm/h)
             is_spike = (curr_clean > 0) & (curr_clean <= 25) & (~temporal_support)
             curr_clean[is_spike] = 0
 
@@ -429,19 +506,25 @@ def generate_radar_dataset():
     all_items.sort(key=lambda x: x['valid_dt'])
     print(f"🧠 Wende 3-Stufen Temporal & Spatial Anti-Pop Filter auf alle {len(all_items)} Frames an...")
 
-    # Temporal Consistency Filter
+    # 1. Temporal Consistency Filter auf raw radar grids
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    # Paralleles Rendern
+    print(f"🌐 Führe Polar-Stereographische Reprojektion & Isolinien-Glättung durch...")
+
+    # 2. Paralleles Reprojizieren und Rendern
     frames_metadata = []
 
     def render_and_save(idx):
         item = all_items[idx]
         grid = cleaned_grids[idx]
+        
+        # Exakte Reprojektion von Polar-Stereo auf WGS84 + Konturglättung
+        warped_grid = reproject_and_smooth_radar(grid)
+        
         file_name = f"radar_{idx:03d}.webp"
         file_path = os.path.join(output_dir, file_name)
-        render_matrix_to_webp(grid, file_path)
+        render_matrix_to_webp(warped_grid, file_path)
 
         return {
             "step": idx,
