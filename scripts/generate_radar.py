@@ -52,7 +52,7 @@ def build_turbo_lut():
             r = int(30 + t * 20)
             g = int(185 + t * 45)
             b = int(245 - t * 15)
-            a = int(220 + t * 35)  # Knackige, saubere Kante mit vollem Kontrast
+            a = int(170 + t * 65)  # Scharfe, saubere Kante ohne trüben Dunst
         elif i < 91:
             # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
             # Bildet wie in der WarnWetter App die voll deckende Hauptmasse des Regens
@@ -142,25 +142,28 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 def reproject_and_smooth_radar(grid_1200x1100):
     """
     1. Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326).
-    2. Verwendet kubische Spline-Interpolation (order=3) für saubere, organische Konturen mit messerscharfen Rändern.
+    2. Wendet organische Konturglättung (Isolinien-Filter) an.
     """
     try:
-        from scipy.ndimage import map_coordinates
+        from scipy.ndimage import map_coordinates, gaussian_filter
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
         
-        # Kubische Spline-Reprojektion (order=3): Perfekt glatte Kurven ohne Weichzeichner-Halo
-        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=3, mode='constant', cval=0.0)
+        # Reprojektion mit bilinearer Interpolation
+        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
         
-        # Scharfe Grenze für Niesel erhalten (kein künstlicher Dunstschleier)
-        warped[warped < 1.0] = 0
-        return np.clip(warped, 0, 255).astype(np.uint8)
+        # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
+        smoothed = gaussian_filter(warped, sigma=0.75)
+        
+        # Scharfe Grenze für Niesel erhalten
+        smoothed[warped == 0] = 0
+        return np.clip(smoothed, 0, 255).astype(np.uint8)
 
     except ImportError:
         # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
-        return np.array(img.resize((1400, 1400), Image.BICUBIC))
+        return np.array(img.resize((1400, 1400), Image.BILINEAR))
 
 
 def remove_isolated_radar_clutter(val):
