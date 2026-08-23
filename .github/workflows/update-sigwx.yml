@@ -49,17 +49,6 @@ jobs:
             python generate_sigwx.py
           fi
 
-      - name: Run DWD Turbo Radar Generator & Uploader
-        env:
-          FTP_SERVER: ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-        run: |
-          if [ -f "scripts/generate_radar.py" ]; then
-            python scripts/generate_radar.py
-          elif [ -f "generate_radar.py" ]; then
-            python generate_radar.py
-          fi
 
       - name: Run DWD 5-Tage Europa-Trend Generator & Uploader
         env:
