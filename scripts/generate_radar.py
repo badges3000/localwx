@@ -97,35 +97,36 @@ TURBO_LUT = build_turbo_lut()
 
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Core-Requirement & Clutter Filter:
-    
-    Echte Regenwolken besitzen immer mindestens einen Niederschlagskern
-    (val >= 5 bzw. > 0.6 mm/h / grüner Kern oder höher).
-    Der feine Niesel (val 1..4) an den Außenrändern dieser echten Wolken
-    wird vollständig und lückenlos erhalten!
-    
-    Cluster, die zu 100% NUR aus schwachem Rauschen (val 1..4) bestehen
-    und keinen einzigen Tropfen echten Regens im Inneren aufweisen,
-    sind physikalische Inversions- und Bodenechos (an den DWD-Radartürmen
-    Frankfurt, Hannover, Essen, Thüringen etc.) und werden restlos gelöscht!
+    Meteorologischer Hysterese- & Flächenfilter:
+
+    1. Große Fronten (>= 150 Pixel / ~30 km²) bleiben IMMER erhalten.
+       Verhindert das Wegploppen und Flickern bei abziehendem/abschwächendem Nieselregen.
+    2. Kleinere Schauerzellen (< 150 Pixel) bleiben nur erhalten, wenn sie einen echten
+       Schauerkern (val >= 4 bzw. > 0.48 mm/h) besitzen.
+    3. Isolierte Mini-Echos (Turm-Clutter mit < 150 Pixeln und val < 4) werden restlos gelöscht.
     """
     if not np.any(val > 0):
         return val
 
     try:
-        from scipy.ndimage import label
+        from scipy.ndimage import label, maximum as nd_max, sum as nd_sum
 
         labeled_array, num_features = label(val > 0)
         if num_features == 0:
             return val
 
-        clean_val = val.copy()
+        indices = np.arange(1, num_features + 1)
+        cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
+        cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        for i in range(1, num_features + 1):
-            mask = (labeled_array == i)
-            # Wenn der Cluster keinen einzigen Pixel mit val >= 5 (echter Regen > 0.6 mm/h) hat:
-            if np.max(val[mask]) < 5:
-                clean_val[mask] = 0
+        # Ein Cluster ist NUR DANN Clutter, wenn er klein ist (< 150 Pixel) UND keinen Schauerkern (val >= 4) hat
+        is_clutter_cluster = (cluster_sizes < 150) & (cluster_maxs < 4)
+        invalid_cluster_ids = indices[is_clutter_cluster]
+
+        clean_val = val.copy()
+        if len(invalid_cluster_ids) > 0:
+            is_invalid_pixel = np.isin(labeled_array, invalid_cluster_ids)
+            clean_val[is_invalid_pixel] = 0
 
         return clean_val
     except ImportError:
@@ -289,11 +290,11 @@ def render_matrix_to_webp(grid_2d, output_path):
 
 def apply_temporal_consistency_filter(grid_list):
     """
-    Temporaler Konsistenz-Filter (Anti-Flicker & Anti-Pop):
-    Untersucht die Sequenz (t-1, t, t+1).
-    Isolierte Sprenkel & Spikes (val <= 3), die nur für exakt einen 5-Minuten-Frame
-    im Nichts aufblitzen, werden eliminiert.
-    Wandernde Fronten und zusammenhängende Regengebiete bleiben zu 100% erhalten.
+    Bidirektionaler temporaler Konsistenz-Filter (Anti-Flicker, Anti-Pop & Gap-Filling):
+    
+    1. Heilt 'Dips': Wenn ein Regengebiet in t-1 und t+1 existiert, aber in t kurzzeitig unter
+       die Messschwelle sinkt -> interpolieren (verhindert das Flackern/Wegploppen).
+    2. Entfernt 'Spikes': Wenn ein schwacher Pixel nur für exakt 1 Frame isoliert aufblitzt -> löschen.
     """
     n = len(grid_list)
     if n < 3:
@@ -308,16 +309,23 @@ def apply_temporal_consistency_filter(grid_list):
             curr_g = grid_list[t]
             next_g = grid_list[t + 1]
 
-            # Finde Gebiete mit Niederschlag in t-1 und t+1 (~5km Suchradius)
+            curr_clean = curr_g.copy()
+
+            # 1. Gap-Filling (Dips heilen):
+            # Wenn in t-1 und t+1 am selben Ort Niederschlag war, aber in t kurz 0 ist -> Mittelwert einsetzen!
+            is_dip = (curr_clean == 0) & (prev_g > 0) & (next_g > 0)
+            if np.any(is_dip):
+                curr_clean[is_dip] = np.maximum(1, (prev_g[is_dip].astype(np.int32) + next_g[is_dip].astype(np.int32)) // 2).astype(np.uint16)
+
+            # 2. Spike-Removal (Popups entfernen):
             prev_active = maximum_filter(prev_g > 0, size=7)
             next_active = maximum_filter(next_g > 0, size=7)
             temporal_support = prev_active | next_active
 
             # Schwache Pixel (val <= 3) ohne zeitlichen Halt in t-1 oder t+1 sind temporäre Glitches
-            is_glitch = (curr_g > 0) & (curr_g <= 3) & (~temporal_support)
+            is_spike = (curr_clean > 0) & (curr_clean <= 3) & (~temporal_support)
+            curr_clean[is_spike] = 0
 
-            curr_clean = curr_g.copy()
-            curr_clean[is_glitch] = 0
             cleaned_list.append(curr_clean)
 
         cleaned_list.append(grid_list[-1].copy())
