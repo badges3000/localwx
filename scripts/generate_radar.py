@@ -419,6 +419,247 @@ def apply_temporal_consistency_filter(grid_list):
         return grid_list
 
 
+def fetch_and_parse_konrad3d(output_dir):
+    """
+    Lädt das neueste DWD KONRAD3D (3D-Zelltracking) XML von opendata.dwd.de herunter
+    und erzeugt ein optimiertes cells.json mit allen aktiven Gewitterzellen,
+    Zugbahnen, Hagel-Flags, dBZ-Werten und Geschwindigkeiten.
+    """
+    print("⚡ Rufe aktuelle DWD KONRAD3D Gewitter- & Hagelzell-Daten ab...")
+    cells_data = {
+        "reference_time": None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_cells": 0,
+        "cells": []
+    }
+    
+    try:
+        url = "https://opendata.dwd.de/weather/radar/konrad3d/"
+        req = urllib.request.Request(url, headers={'User-Agent': 'localwx-Radar/2.0'})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+        
+        files = re.findall(r'href="(KONRAD3D_[^"]+\.xml)"', html)
+        if not files:
+            print("ℹ️ Keine KONRAD3D-Dateien auf opendata.dwd.de gefunden.")
+            with open(os.path.join(output_dir, "cells.json"), 'w', encoding='utf-8') as f:
+                json.dump(cells_data, f, indent=2, ensure_ascii=False)
+            return cells_data
+
+        latest_file = sorted(files)[-1]
+        print(f"🌩️ Lade neueste KONRAD3D-Datei: {latest_file}...")
+        
+        file_url = f"https://opendata.dwd.de/weather/radar/konrad3d/{latest_file}"
+        with urllib.request.urlopen(file_url, timeout=15) as resp:
+            xml_bytes = resp.read()
+
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_bytes)
+        
+        ref_time_elem = root.find('.//metadata/reference_time')
+        ref_time = ref_time_elem.text if ref_time_elem is not None else datetime.now(timezone.utc).isoformat()
+        cells_data["reference_time"] = ref_time
+
+        parsed_cells = []
+        for feat in root.findall('.//feature'):
+            feat_id = feat.attrib.get('identifier', str(len(parsed_cells) + 1))
+            
+            # 1. Centroid (Schwerpunkt)
+            centroid = feat.find('.//centroid_3d/geodetic_coordinate')
+            if centroid is None:
+                continue
+            lat_elem = centroid.find('latitude')
+            lon_elem = centroid.find('longitude')
+            if lat_elem is None or lon_elem is None:
+                continue
+            lat = round(float(lat_elem.text), 5)
+            lon = round(float(lon_elem.text), 5)
+            
+            height_elem = centroid.find('height_msl')
+            height_m = round(float(height_elem.text), 0) if height_elem is not None else 0
+            
+            # 2. Motion & Velocity
+            motion = feat.find('.//motion')
+            speed = 0.0
+            direction = 0.0
+            if motion is not None:
+                sp_elem = motion.find('.//speed')
+                if sp_elem is not None and sp_elem.text:
+                    try:
+                        speed = round(float(sp_elem.text), 1)
+                    except ValueError:
+                        pass
+                dir_elem = motion.find('.//direction')
+                if dir_elem is not None and dir_elem.text:
+                    try:
+                        direction = round(float(dir_elem.text), 0)
+                    except ValueError:
+                        pass
+            
+            if speed == 0.0:
+                cs_elem = feat.find('.//cell_speed')
+                if cs_elem is not None and cs_elem.text:
+                    try:
+                        speed = round(float(cs_elem.text), 1)
+                    except ValueError:
+                        pass
+
+            # 3. Intensity, Reflectivity & Hazards
+            intensity = feat.find('.//intensity')
+            max_dbz = 0.0
+            severity = 0
+            hail_flag = 0
+            heavy_rain_flag = 0
+            gust_speed = 0.0
+            
+            if intensity is not None:
+                dbz_elem = intensity.find('max_value')
+                if dbz_elem is not None and dbz_elem.text:
+                    try:
+                        max_dbz = round(float(dbz_elem.text), 1)
+                    except ValueError:
+                        pass
+                
+                sev_elem = intensity.find('severity')
+                if sev_elem is not None and sev_elem.text:
+                    try:
+                        severity = int(sev_elem.text)
+                    except ValueError:
+                        pass
+                
+                hf_elem = intensity.find('hail_flag')
+                if hf_elem is not None and hf_elem.text:
+                    try:
+                        hail_flag = int(hf_elem.text)
+                    except ValueError:
+                        pass
+                        
+                hrf_elem = intensity.find('heavy_rain_flag')
+                if hrf_elem is not None and hrf_elem.text:
+                    try:
+                        heavy_rain_flag = int(hrf_elem.text)
+                    except ValueError:
+                        pass
+                        
+                gust_elem = intensity.find('maximum_estimated_wind_gust')
+                if gust_elem is not None and gust_elem.text:
+                    try:
+                        gust_speed = round(float(gust_elem.text), 1)
+                    except ValueError:
+                        pass
+
+            # 4. Lightning & Mesocyclone
+            lightning_rate = 0
+            lt_elem = feat.find('.//lightning/lightning_rate')
+            if lt_elem is not None and lt_elem.text:
+                try:
+                    lightning_rate = int(round(float(lt_elem.text)))
+                except ValueError:
+                    pass
+
+            is_mesocyclone = False
+            meso_elem = feat.find('.//mesocyclone/mesocyclone_severity_index')
+            if meso_elem is not None and meso_elem.text:
+                try:
+                    is_mesocyclone = int(meso_elem.text) > 0
+                except ValueError:
+                    pass
+
+            # 5. Geodetic Polygon
+            polygon_coords = []
+            poly = feat.find('.//polygons_projected/geodetic_coordinates/polygon')
+            if poly is not None:
+                lats_elem = poly.find('latitudes')
+                lons_elem = poly.find('longitudes')
+                if lats_elem is not None and lons_elem is not None and lats_elem.text and lons_elem.text:
+                    try:
+                        lats_list = [round(float(x), 5) for x in lats_elem.text.strip().split()]
+                        lons_list = [round(float(x), 5) for x in lons_elem.text.strip().split()]
+                        polygon_coords = [[lt, ln] for lt, ln in zip(lats_list, lons_list)]
+                    except Exception:
+                        pass
+
+            # 6. Future Track Forecast (+15m, +30m, +45m, +60m)
+            forecast_track = []
+            for fc_elem in feat.findall('.//forecast/centroid_forecasts/centroid_forecast'):
+                fc_lat = fc_elem.find('latitude')
+                fc_lon = fc_elem.find('longitude')
+                lead_time = fc_elem.attrib.get('lead_time_in_minutes', '15')
+                if fc_lat is not None and fc_lon is not None and fc_lat.text and fc_lon.text:
+                    try:
+                        forecast_track.append({
+                            "lead_time_min": int(lead_time) if lead_time.isdigit() else 15,
+                            "lat": round(float(fc_lat.text), 5),
+                            "lon": round(float(fc_lon.text), 5)
+                        })
+                    except ValueError:
+                        pass
+
+            if not forecast_track and speed > 5:
+                rad = np.radians((direction + 180) % 360)
+                for step_min in [15, 30, 45, 60]:
+                    dist_km = speed * (step_min / 60.0)
+                    d_lat = (dist_km * np.cos(rad)) / 111.32
+                    d_lon = (dist_km * np.sin(rad)) / (111.32 * np.cos(np.radians(lat)))
+                    forecast_track.append({
+                        "lead_time_min": step_min,
+                        "lat": round(lat + d_lat, 5),
+                        "lon": round(lon + d_lon, 5)
+                    })
+
+            # Farb- & Gefahrenklassifikation
+            level = "moderate"
+            level_name = "Mäßiges Gewitter"
+            color = "#f59e0b"
+            
+            if is_mesocyclone or max_dbz >= 65:
+                level = "extreme"
+                level_name = "Extremes Unwetter / Superzelle"
+                color = "#d946ef"
+            elif hail_flag or max_dbz >= 55 or gust_speed >= 75:
+                level = "severe"
+                level_name = "Schweres Gewitter / Hagel"
+                color = "#ef4444"
+            elif max_dbz >= 45 or heavy_rain_flag:
+                level = "strong"
+                level_name = "Kräftiges Gewitter"
+                color = "#f97316"
+
+            parsed_cells.append({
+                "id": feat_id,
+                "lat": lat,
+                "lon": lon,
+                "height_m": height_m,
+                "level": level,
+                "level_name": level_name,
+                "color": color,
+                "max_dbz": max_dbz,
+                "severity": severity,
+                "is_hail": bool(hail_flag),
+                "is_heavy_rain": bool(heavy_rain_flag),
+                "is_mesocyclone": is_mesocyclone,
+                "max_gust_kmh": gust_speed,
+                "speed_kmh": speed,
+                "direction_deg": direction,
+                "lightning_rate": lightning_rate,
+                "polygon": polygon_coords,
+                "forecast_track": forecast_track
+            })
+
+        cells_data["total_cells"] = len(parsed_cells)
+        cells_data["cells"] = parsed_cells
+        print(f"✅ {len(parsed_cells)} aktive Gewitterzellen erfolgreich aus KONRAD3D geparst.")
+
+    except Exception as e:
+        print(f"⚠️ Hinweis bei KONRAD3D Parsing: {e}")
+
+    cells_path = os.path.join(output_dir, "cells.json")
+    with open(cells_path, 'w', encoding='utf-8') as f:
+        json.dump(cells_data, f, indent=2, ensure_ascii=False)
+
+    return cells_data
+
+
 def generate_radar_dataset():
     start_time = time.time()
     print("🚀 Starte DWD RADOLAN HD 5-Minuten Turbo-Radar Generator (100% DWD OpenData)...")
@@ -543,6 +784,9 @@ def generate_radar_dataset():
     frames_metadata.sort(key=lambda x: x['step'])
     print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
 
+    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen
+    cells_result = fetch_and_parse_konrad3d(output_dir)
+
     metadata = {
         "model": "DWD RADOLAN HD",
         "parameter": "precipitation_radar",
@@ -550,6 +794,8 @@ def generate_radar_dataset():
         "unit": "mm/h",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bounds": RADAR_BOUNDS,
+        "cells_file": "cells.json",
+        "cells_count": cells_result.get("total_cells", 0),
         "frames": frames_metadata
     }
 
@@ -558,7 +804,7 @@ def generate_radar_dataset():
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
     duration = round(time.time() - start_time, 1)
-    print(f"🎉 Radar-Generierung in {duration}s abgeschlossen!")
+    print(f"🎉 Radar- & KONRAD3D-Generierung in {duration}s abgeschlossen!")
 
     upload_directory_to_ftp(output_dir, "radar")
 
