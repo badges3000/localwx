@@ -579,33 +579,49 @@ def fetch_and_parse_konrad3d(output_dir):
                     except Exception:
                         pass
 
-            # 6. Future Track Forecast (+15m, +30m, +45m, +60m)
+            # 6. Future Track Forecast (+5m bis +60m direkt aus DWD centroid_forecast)
             forecast_track = []
             for fc_elem in feat.findall('.//forecast/centroid_forecasts/centroid_forecast'):
-                fc_lat = fc_elem.find('latitude')
-                fc_lon = fc_elem.find('longitude')
-                lead_time = fc_elem.attrib.get('lead_time_in_minutes', '15')
+                fc_lat = fc_elem.find('.//geodetic_coordinate/latitude')
+                if fc_lat is None:
+                    fc_lat = fc_elem.find('latitude')
+                fc_lon = fc_elem.find('.//geodetic_coordinate/longitude')
+                if fc_lon is None:
+                    fc_lon = fc_elem.find('longitude')
+                
+                fc_time_str = fc_elem.attrib.get('forecast_time', '')
+                lead_time_min = 0
+                if fc_time_str and ref_time:
+                    try:
+                        t_ref = datetime.fromisoformat(ref_time.replace('Z', '+00:00'))
+                        t_fc = datetime.fromisoformat(fc_time_str.replace('Z', '+00:00'))
+                        lead_time_min = int(round((t_fc - t_ref).total_seconds() / 60.0))
+                    except Exception:
+                        lead_time_min = (len(forecast_track) + 1) * 5
+                else:
+                    lead_time_min = (len(forecast_track) + 1) * 5
+
                 if fc_lat is not None and fc_lon is not None and fc_lat.text and fc_lon.text:
                     try:
                         forecast_track.append({
-                            "lead_time_min": int(lead_time) if lead_time.isdigit() else 15,
+                            "lead_time_min": lead_time_min,
                             "lat": round(float(fc_lat.text), 5),
                             "lon": round(float(fc_lon.text), 5)
                         })
                     except ValueError:
                         pass
 
-            if not forecast_track and speed > 5:
-                rad = np.radians((direction + 180) % 360)
-                for step_min in [15, 30, 45, 60]:
-                    dist_km = speed * (step_min / 60.0)
-                    d_lat = (dist_km * np.cos(rad)) / 111.32
-                    d_lon = (dist_km * np.sin(rad)) / (111.32 * np.cos(np.radians(lat)))
-                    forecast_track.append({
-                        "lead_time_min": step_min,
-                        "lat": round(lat + d_lat, 5),
-                        "lon": round(lon + d_lon, 5)
-                    })
+            # Berechne echte Zugrichtung & Geschwindigkeit aus dem ersten Vektorpunkt falls nicht explizit gegeben
+            if forecast_track:
+                first_pt = forecast_track[0]
+                d_lat = first_pt["lat"] - lat
+                d_lon = (first_pt["lon"] - lon) * np.cos(np.radians(lat))
+                angle_deg = np.degrees(np.arctan2(d_lon, d_lat))
+                if direction == 0:
+                    direction = round((angle_deg + 360) % 360, 0)
+                if speed == 0 and first_pt["lead_time_min"] > 0:
+                    dist_km = np.sqrt((d_lat * 111.32)**2 + (d_lon * 111.32)**2)
+                    speed = round(dist_km / (first_pt["lead_time_min"] / 60.0), 1)
 
             # Farb- & Gefahrenklassifikation
             level = "moderate"
