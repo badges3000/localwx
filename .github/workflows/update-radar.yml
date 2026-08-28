@@ -2,12 +2,12 @@ name: DWD RADOLAN HD Radar Pipeline
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '4,19,34,49 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: radar-pipeline
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   generate-and-deploy:
