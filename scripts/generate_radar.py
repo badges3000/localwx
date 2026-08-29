@@ -102,7 +102,7 @@ _WARP_COORDS = None
 
 def get_reprojection_coords(target_h=1400, target_w=1400):
     """
-    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> WGS84).
+    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> Web Mercator EPSG:3857).
     Wird einmalig vorberechnet und für alle 120 Frames wiederverwendet.
     """
     global _WARP_COORDS
@@ -118,8 +118,13 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     lon_0 = np.radians(10.0)   # Zentralmeridian 10°E
     scale = R * (1.0 + np.sin(lat_ts))
 
-    # Reguläres Lat/Lon Gitter für Leaflet WebMap (von Nord nach Süd)
-    lats = np.linspace(lat_max, lat_min, target_h)
+    # Exakte Web-Mercator (EPSG:3857) Breiten-Abtastung (Nord oben nach Süd unten):
+    y_merc_max = np.log(np.tan(np.pi / 4.0 + np.radians(lat_max) / 2.0))
+    y_merc_min = np.log(np.tan(np.pi / 4.0 + np.radians(lat_min) / 2.0))
+    y_merc_grid = np.linspace(y_merc_max, y_merc_min, target_h)
+    lats = np.degrees(2.0 * np.arctan(np.exp(y_merc_grid)) - np.pi / 2.0)
+
+    # Längengrade sind in Web Mercator und WGS84 linear:
     lons = np.linspace(lon_min, lon_max, target_w)
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
