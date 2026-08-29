@@ -397,6 +397,39 @@ def colorize_snow(grid_2d):
     return rgba
 
 
+# ==============================================================================
+# EXAKTE WEB-MERCATOR (EPSG:3857) ENTZERRUNG FÜR LEAFLET / OPENSTREETMAP
+# ==============================================================================
+
+_SIGWX_WARP_CACHE = {}
+
+def reproject_rgba_to_web_mercator(rgba_array, lat_min=43.18, lat_max=58.08, target_h=1400, target_w=1400):
+    """
+    Entzerrt das reguläre DWD Lat/Lon-Gitter (Plate Carrée / EPSG:4326) in das
+    Web-Mercator-Format (EPSG:3857) für eine 100% deckungsgleiche Überlagerung in Leaflet/OpenStreetMap.
+    Eliminiert den ca. 56 km Nord-Versatz in Mittel-/Nordeuropa vollständig.
+    """
+    key = (rgba_array.shape[0], rgba_array.shape[1], round(lat_min, 3), round(lat_max, 3), target_h, target_w)
+    if key not in _SIGWX_WARP_CACHE:
+        Nj, Ni = rgba_array.shape[0], rgba_array.shape[1]
+        y_merc_max = np.log(np.tan(np.pi / 4.0 + np.radians(lat_max) / 2.0))
+        y_merc_min = np.log(np.tan(np.pi / 4.0 + np.radians(lat_min) / 2.0))
+        
+        # Lineare Abtastung im Mercator-Y-Raum (von Nord/oben nach Süd/unten)
+        y_merc_grid = np.linspace(y_merc_max, y_merc_min, target_h)
+        target_lats = np.degrees(2.0 * np.arctan(np.exp(y_merc_grid)) - np.pi / 2.0)
+        
+        # Quell-Zeilen im Eingangs-Array (0 = lat_max, Nj-1 = lat_min)
+        src_rows = (lat_max - target_lats) / (lat_max - lat_min) * (Nj - 1)
+        src_row_idx = np.clip(np.round(src_rows).astype(np.int32), 0, Nj - 1)
+        src_col_idx = np.clip(np.round(np.linspace(0, Ni - 1, target_w)).astype(np.int32), 0, Ni - 1)
+        
+        _SIGWX_WARP_CACHE[key] = (src_row_idx, src_col_idx)
+
+    src_row_idx, src_col_idx = _SIGWX_WARP_CACHE[key]
+    return rgba_array[src_row_idx[:, None], src_col_idx[None, :]]
+
+
 def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_size=(1024, 1024)):
     """
     Liest die GRIB2-Datei mit eccodes, wendet die Vektor-Colormap an und speichert das PNG.
@@ -461,15 +494,9 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
             else:
                 rgba_array = colorize_sigwx(grid_2d)
 
-            # Falls Scan von Süd nach Nord läuft, vertikal spiegeln
+            # Falls Scan von Süd nach Nord läuft, vertikal spiegeln (Nord oben)
             if j_scans_pos == 1:
                 rgba_array = np.flipud(rgba_array)
-
-            img = Image.fromarray(rgba_array, mode='RGBA')
-            # 1400x1400 Auflösung für gestochen scharfe Details beim Hereinzoomen
-            img_resized = img.resize((1400, 1400), Image.NEAREST)
-            # 100% verlustfreies WebP (Zero Artifacts) mit Alpha-Transparenz
-            img_resized.save(output_png_path, 'WEBP', lossless=True, method=6)
 
             min_lat = round(min(lat_first, lat_last), 2)
             max_lat = round(max(lat_first, lat_last), 2)
@@ -480,6 +507,13 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
             if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
                 min_lat, max_lat = 43.18, 58.08
                 min_lon, max_lon = -3.94, 20.34
+
+            # Exakte Web-Mercator (EPSG:3857) Entzerrung für Leaflet
+            warped_rgba = reproject_rgba_to_web_mercator(rgba_array, min_lat, max_lat, 1400, 1400)
+
+            img = Image.fromarray(warped_rgba, mode='RGBA')
+            # 100% verlustfreies WebP (Zero Artifacts) mit Alpha-Transparenz
+            img.save(output_png_path, 'WEBP', lossless=True, method=6)
 
             return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
 
@@ -534,10 +568,6 @@ def render_hourly_precip_diff(grib_curr_path, grib_prev_path, output_webp_path):
             if j_scans_pos == 1:
                 rgba_array = np.flipud(rgba_array)
 
-            img = Image.fromarray(rgba_array, mode='RGBA')
-            img_resized = img.resize((1400, 1400), Image.NEAREST)
-            img_resized.save(output_webp_path, 'WEBP', lossless=True, method=6)
-
             min_lat = round(min(lat_first, lat_last), 2)
             max_lat = round(max(lat_first, lat_last), 2)
             min_lon = round(min(lon_first, lon_last), 2)
@@ -546,6 +576,12 @@ def render_hourly_precip_diff(grib_curr_path, grib_prev_path, output_webp_path):
             if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
                 min_lat, max_lat = 43.18, 58.08
                 min_lon, max_lon = -3.94, 20.34
+
+            # Exakte Web-Mercator (EPSG:3857) Entzerrung für Leaflet
+            warped_rgba = reproject_rgba_to_web_mercator(rgba_array, min_lat, max_lat, 1400, 1400)
+
+            img = Image.fromarray(warped_rgba, mode='RGBA')
+            img.save(output_webp_path, 'WEBP', lossless=True, method=6)
 
             return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
     except Exception as e:
