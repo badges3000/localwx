@@ -461,10 +461,11 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
 
         # Nur snappen, wenn im Umkreis tatsächlich ein relevanter Niederschlagskern (>= 15) existiert
         if max_val >= 15:
-            threshold = max(15, int(0.6 * max_val))
+            # Fokus auf den echten Peak-Kern (>= 82% des Maximums) mit quadratischer Gewichtung
+            threshold = max(15, int(0.82 * max_val))
             mask = window >= threshold
             y_indices, x_indices = np.where(mask)
-            weights = window[mask].astype(np.float64)
+            weights = np.power(window[mask].astype(np.float64) - threshold + 1.0, 2.0)
             
             if np.sum(weights) > 0:
                 x_ground = np.sum(x_indices * weights) / np.sum(weights) + xmin
