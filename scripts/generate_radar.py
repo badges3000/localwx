@@ -648,6 +648,7 @@ def fetch_and_parse_konrad3d(output_dir):
 
             parsed_cells.append({
                 "id": feat_id,
+                "reference_time": ref_time,
                 "lat": lat,
                 "lon": lon,
                 "height_m": height_m,
