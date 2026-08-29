@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """
-DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - CRASH-PROOF & TURBO
-=================================================================================
-Zuverlässiger, paralleler Multiprocess-Renderer für echte DWD ICON-EU GRIB2-Karten.
-
-Features:
-- Robuster, zeitbegrenzter Pre-Fetch für Cartopy-Features (Kein Hang bei Natural Earth)
-- Parallelisiertes Chart-Rendering via ProcessPoolExecutor
-- Sauberes Eccodes Memory-Management
-- 100% thread- & process-safe
-- Upload per FTPS nach /data/synoptic/
+DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - DEADLOCK-FREE
+===========================================================================
+Paralleler, crash- und deadlock-sicherer Renderer für DWD ICON-EU Modellkarten.
 """
 
 import os
@@ -17,27 +10,25 @@ import sys
 import json
 import time
 import bz2
+import zipfile
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import multiprocessing as mp
 import numpy as np
 from PIL import Image
 import ftplib
 import ssl
 
-# Matplotlib headless backend
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# Cartopy Pre-Check & Feature Setup
 try:
+    import cartopy
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
-    import cartopy.io.shapereader as shpreader
     CARTOPY_AVAILABLE = True
 except ImportError:
     CARTOPY_AVAILABLE = False
@@ -50,78 +41,67 @@ except ImportError:
 
 
 # ==============================================================================
-# LOCALWX METEOROLOGISCHE FARBSKALEN
+# 1. ROBUSTER OFFLINE-DOWNLOAD DER KARTEN-GEOMETRIEN (KEIN DEADLOCK)
 # ==============================================================================
 
-def get_localwx_temp_cmap():
-    colors = [
-        (0.00, '#6b21a8'),   # -36°C: Tiefes Violett
-        (0.08, '#9333ea'),   # -30°C: Violett
-        (0.15, '#c084fc'),   # -24°C: Helles Flieder
-        (0.23, '#1d4ed8'),   # -18°C: Tiefblau
-        (0.31, '#2563eb'),   # -12°C: Königsblau
-        (0.38, '#38bdf8'),   #  -6°C: Eisblau
-        (0.44, '#7dd3fc'),   #  -2°C: Zartes Eiscyan
-        (0.46, '#e0f2fe'),   #   0°C: Frostgrenze (Weißblau)
-        (0.51, '#86efac'),   #  +4°C: Helles Frühlingsgrün
-        (0.58, '#22c55e'),   # +10°C: Smaragdgrün
-        (0.65, '#eab308'),   # +16°C: Warmes Goldgelb
-        (0.73, '#f97316'),   # +22°C: Sonniges Orange
-        (0.81, '#ef4444'),   # +28°C: Warmrot (Sommertag)
-        (0.88, '#dc2626'),   # +34°C: Intensives Scharlachrot (Heißer Tag)
-        (0.95, '#991b1b'),   # +38°C: Dunkelrot
-        (1.00, '#ec4899')    # +42°C: Magenta
-    ]
-    return mcolors.LinearSegmentedColormap.from_list('localwx_temp', [(pos, col) for pos, col in colors], N=256)
-
-
-def get_localwx_jet_cmap():
-    colors = [
-        (0.00, '#0f172a'),   # < 40 km/h
-        (0.15, '#0369a1'),   # 70 km/h: Blau
-        (0.30, '#0d9488'),   # 110 km/h: Türkis
-        (0.45, '#16a34a'),   # 150 km/h: Grün
-        (0.60, '#eab308'),   # 190 km/h: Gelb
-        (0.75, '#ea580c'),   # 230 km/h: Orange
-        (0.88, '#dc2626'),   # 270 km/h: Rot (Jet-Kern)
-        (1.00, '#d946ef')    # 320+ km/h: Magenta
-    ]
-    return mcolors.LinearSegmentedColormap.from_list('localwx_jet', [(pos, col) for pos, col in colors], N=256)
-
-
-TEMP_CMAP = get_localwx_temp_cmap()
-JET_CMAP = get_localwx_jet_cmap()
-
-
-# ==============================================================================
-# CARTOPY FEATURE PRE-FETCH (KEIN NETWORK HANG)
-# ==============================================================================
-
-def preload_cartopy_features():
+def setup_cartopy_offline():
     """
-    Lädt die benötigten Cartopy Natural Earth Features vorab mit striktem Timeout.
-    Verhindert Hängenbleiben bei überlasteten Amazon S3 Mirrors.
+    Lädt Küsten und Grenzen einmalig direkt herunter und entpackt sie in den Cartopy-Cache.
+    Verhindert Lock-Konflikte und Timeouts in Multiprocessing-Workern.
     """
     if not CARTOPY_AVAILABLE:
         return
 
-    print("🗺️ Initialisiere Geometrie-Features...")
-    socket_default_timeout = 10
-    import socket
-    socket.setdefaulttimeout(socket_default_timeout)
+    data_dir = cartopy.config.get('data_dir', os.path.expanduser('~/.local/share/cartopy'))
+    target_dir = os.path.join(data_dir, 'shapefiles', 'natural_earth', 'physical')
+    target_cultural = os.path.join(data_dir, 'shapefiles', 'natural_earth', 'cultural')
+    os.makedirs(target_dir, exist_ok=True)
+    os.makedirs(target_cultural, exist_ok=True)
 
-    for feature_name, category, name in [
-        ('Coastline', 'physical', 'coastline'),
-        ('Borders', 'cultural', 'admin_0_boundary_lines_land'),
-        ('Lakes', 'physical', 'lakes')
-    ]:
+    downloads = [
+        ("https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_coastline.zip", target_dir, "ne_50m_coastline.shp"),
+        ("https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_0_boundary_lines_land.zip", target_cultural, "ne_50m_admin_0_boundary_lines_land.shp"),
+        ("https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_lakes.zip", target_dir, "ne_50m_lakes.shp")
+    ]
+
+    print("🗺️ Lade Geometrien für synoptische Karten vorab...")
+    for url, out_folder, check_file in downloads:
+        if os.path.exists(os.path.join(out_folder, check_file)):
+            continue
         try:
-            shpreader.natural_earth(resolution='50m', category=category, name=name)
-        except Exception:
-            try:
-                shpreader.natural_earth(resolution='110m', category=category, name=name)
-            except Exception as e:
-                print(f"⚠️ Hinweis bei {feature_name}: {e} (Fallback aktiv)")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            zip_path = os.path.join(out_folder, "temp.zip")
+            with urllib.request.urlopen(req, timeout=15) as resp, open(zip_path, 'wb') as f:
+                f.write(resp.read())
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(out_folder)
+            os.remove(zip_path)
+        except Exception as e:
+            print(f"⚠️ Hinweis bei {check_file}: {e} (Fallback auf Low-Res)")
+
+
+# ==============================================================================
+# FARBSKALEN
+# ==============================================================================
+
+def get_localwx_temp_cmap():
+    colors = [
+        (0.00, '#6b21a8'), (0.08, '#9333ea'), (0.15, '#c084fc'), (0.23, '#1d4ed8'),
+        (0.31, '#2563eb'), (0.38, '#38bdf8'), (0.44, '#7dd3fc'), (0.46, '#e0f2fe'),
+        (0.51, '#86efac'), (0.58, '#22c55e'), (0.65, '#eab308'), (0.73, '#f97316'),
+        (0.81, '#ef4444'), (0.88, '#dc2626'), (0.95, '#991b1b'), (1.00, '#ec4899')
+    ]
+    return mcolors.LinearSegmentedColormap.from_list('localwx_temp', [(pos, col) for pos, col in colors], N=256)
+
+def get_localwx_jet_cmap():
+    colors = [
+        (0.00, '#0f172a'), (0.15, '#0369a1'), (0.30, '#0d9488'), (0.45, '#16a34a'),
+        (0.60, '#eab308'), (0.75, '#ea580c'), (0.88, '#dc2626'), (1.00, '#d946ef')
+    ]
+    return mcolors.LinearSegmentedColormap.from_list('localwx_jet', [(pos, col) for pos, col in colors], N=256)
+
+TEMP_CMAP = get_localwx_temp_cmap()
+JET_CMAP = get_localwx_jet_cmap()
 
 
 # ==============================================================================
@@ -187,105 +167,141 @@ def parse_grib_array(grib_bytes):
 
 
 # ==============================================================================
-# WORKER FUNKTION FÜR MULTIPROCESSING RENDERING
+# KARTEN-RENDERING EINES KOMPLETTEN ZEITSCHRITTS (TASK)
 # ==============================================================================
 
-def render_single_chart_task(task_args):
-    param, domain, lead_h, run_date_iso, data_dict, output_path = task_args
+def render_step_task(task_args):
+    """
+    Verarbeitet alle 8 Karten (4 Parameter x 2 Domains) eines Zeitschritts autark im Worker-Prozess.
+    """
+    lead_h, date_str, run_str, run_date_iso, base_url, output_base = task_args
     run_date = datetime.fromisoformat(run_date_iso)
     valid_date = run_date + timedelta(hours=lead_h)
-    lats, lons = data_dict['lats'], data_dict['lons']
+    lead_str = f"{lead_h:03d}"
 
-    if param == 't850_gp':
-        field_val = data_dict['t850']
-        geopot_gpdm = data_dict['fi850']
-        title_str = "850 hPa Geopotential (gpdm) & Temperatur (°C)"
-        unit_str = "°C"
-        cmap = TEMP_CMAP
-        levels = np.arange(-36, 43, 2)
-        contour_levels = np.arange(120, 175, 5)
-        contour_label_fmt = "%d"
+    url_map = {
+        't850': f"{base_url}/t/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_T.grib2.bz2",
+        'fi850': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_FI.grib2.bz2",
+        'fi500': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_500_FI.grib2.bz2",
+        'fi300': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_FI.grib2.bz2",
+        'pmsl': f"{base_url}/pmsl/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_PMSL.grib2.bz2",
+        'u300': f"{base_url}/u/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_U.grib2.bz2",
+        'v300': f"{base_url}/v/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_V.grib2.bz2",
+        't2m': f"{base_url}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_T_2M.grib2.bz2"
+    }
 
-    elif param == 'z500_mslp':
-        field_val = data_dict['fi500']
-        geopot_gpdm = data_dict['pmsl']
-        title_str = "500 hPa Geopotentialhöhe (gpdm) & Bodendruck (hPa)"
-        unit_str = "gpdm"
-        cmap = TEMP_CMAP
-        levels = np.arange(496, 604, 4)
-        contour_levels = np.arange(960, 1060, 5)
-        contour_label_fmt = "%d"
+    raw_bytes = {}
+    with ThreadPoolExecutor(max_workers=8) as dl_exec:
+        fut_map = {dl_exec.submit(fetch_dwd_file, url): key for key, url in url_map.items()}
+        for fut in as_completed(fut_map):
+            key = fut_map[fut]
+            raw_bytes[key] = fut.result()
 
-    elif param == 'jet300':
-        field_val = data_dict['jet300']
-        geopot_gpdm = data_dict['fi300']
-        title_str = "300 hPa Wind & Jetstream (km/h) & 300 hPa Isohypsen"
-        unit_str = "km/h"
-        cmap = JET_CMAP
-        levels = np.arange(40, 330, 20)
-        contour_levels = np.arange(840, 980, 8)
-        contour_label_fmt = "%d"
+    t850_arr, lats, lons = parse_grib_array(raw_bytes.get('t850'))
+    fi850_arr, _, _ = parse_grib_array(raw_bytes.get('fi850'))
+    fi500_arr, _, _ = parse_grib_array(raw_bytes.get('fi500'))
+    fi300_arr, _, _ = parse_grib_array(raw_bytes.get('fi300'))
+    pmsl_arr, _, _ = parse_grib_array(raw_bytes.get('pmsl'))
+    u300_arr, _, _ = parse_grib_array(raw_bytes.get('u300'))
+    v300_arr, _, _ = parse_grib_array(raw_bytes.get('v300'))
+    t2m_arr, _, _ = parse_grib_array(raw_bytes.get('t2m'))
 
-    else:
-        field_val = data_dict['t2m']
-        geopot_gpdm = data_dict['pmsl']
-        title_str = "2m Temperatur (°C) & Bodendruck (hPa)"
-        unit_str = "°C"
-        cmap = TEMP_CMAP
-        levels = np.arange(-30, 45, 2)
-        contour_levels = np.arange(970, 1050, 5)
-        contour_label_fmt = "%d"
+    if lats is None or lons is None:
+        return lead_h, []
 
-    fig = plt.figure(figsize=(13.33, 8.33), dpi=96, facecolor='#0b0f19')
+    data = {
+        't850': (t850_arr - 273.15) if t850_arr is not None else None,
+        'fi850': (fi850_arr / 98.0665) if fi850_arr is not None else None,
+        'fi500': (fi500_arr / 98.0665) if fi500_arr is not None else None,
+        'fi300': (fi300_arr / 98.0665) if fi300_arr is not None else None,
+        'pmsl': (pmsl_arr / 100.0) if pmsl_arr is not None else None,
+        'jet300': (np.sqrt(u300_arr**2 + v300_arr**2) * 3.6) if (u300_arr is not None and v300_arr is not None) else None,
+        't2m': (t2m_arr - 273.15) if t2m_arr is not None else None
+    }
 
-    if CARTOPY_AVAILABLE:
-        proj = ccrs.LambertConformal(central_longitude=10.0, central_latitude=50.0)
-        ax = fig.add_axes([0.02, 0.08, 0.96, 0.83], projection=proj)
-        
-        if domain == 'germany':
-            ax.set_extent([4.5, 16.5, 46.5, 55.8], crs=ccrs.PlateCarree())
+    lon_mesh, lat_mesh = np.meshgrid(lons, lats)
+    proj = ccrs.LambertConformal(central_longitude=10.0, central_latitude=50.0) if CARTOPY_AVAILABLE else None
+
+    params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
+    domains = ['europe', 'germany']
+    generated_frames = []
+
+    for p in params:
+        if p == 't850_gp':
+            field_val, geopot_gpdm = data['t850'], data['fi850']
+            title_str, unit_str, cmap = "850 hPa Geopotential (gpdm) & Temperatur (°C)", "°C", TEMP_CMAP
+            levels, contour_levels, contour_fmt = np.arange(-36, 43, 2), np.arange(120, 175, 5), "%d"
+        elif p == 'z500_mslp':
+            field_val, geopot_gpdm = data['fi500'], data['pmsl']
+            title_str, unit_str, cmap = "500 hPa Geopotentialhöhe (gpdm) & Bodendruck (hPa)", "gpdm", TEMP_CMAP
+            levels, contour_levels, contour_fmt = np.arange(496, 604, 4), np.arange(960, 1060, 5), "%d"
+        elif p == 'jet300':
+            field_val, geopot_gpdm = data['jet300'], data['fi300']
+            title_str, unit_str, cmap = "300 hPa Wind & Jetstream (km/h) & 300 hPa Isohypsen", "km/h", JET_CMAP
+            levels, contour_levels, contour_fmt = np.arange(40, 330, 20), np.arange(840, 980, 8), "%d"
         else:
-            ax.set_extent([-16.0, 36.0, 34.0, 68.0], crs=ccrs.PlateCarree())
+            field_val, geopot_gpdm = data['t2m'], data['pmsl']
+            title_str, unit_str, cmap = "2m Temperatur (°C) & Bodendruck (hPa)", "°C", TEMP_CMAP
+            levels, contour_levels, contour_fmt = np.arange(-30, 45, 2), np.arange(970, 1050, 5), "%d"
 
-        lon_mesh, lat_mesh = np.meshgrid(lons, lats)
-        cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both', transform=ccrs.PlateCarree())
+        for dom in domains:
+            fig = plt.figure(figsize=(13.33, 8.33), dpi=96, facecolor='#0b0f19')
 
-        try:
-            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='#0f172a', linewidth=0.9, zorder=3)
-            ax.add_feature(cfeature.BORDERS.with_scale('50m'), edgecolor='#334155', linewidth=0.6, linestyle=':', zorder=3)
-            ax.add_feature(cfeature.LAKES.with_scale('50m'), edgecolor='#0f172a', facecolor='none', linewidth=0.5, zorder=3)
-        except Exception:
-            ax.coastlines(resolution='110m', color='#0f172a', linewidth=0.8)
+            if CARTOPY_AVAILABLE:
+                ax = fig.add_axes([0.02, 0.08, 0.96, 0.83], projection=proj)
+                if dom == 'germany':
+                    ax.set_extent([4.5, 16.5, 46.5, 55.8], crs=ccrs.PlateCarree())
+                else:
+                    ax.set_extent([-16.0, 36.0, 34.0, 68.0], crs=ccrs.PlateCarree())
 
-        if geopot_gpdm is not None:
-            cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.3, zorder=4, transform=ccrs.PlateCarree())
-            ax.clabel(cs, inline=True, fmt=contour_label_fmt, fontsize=9, colors='#ffffff', inline_spacing=8)
+                cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both', transform=ccrs.PlateCarree())
+                
+                try:
+                    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='#0f172a', linewidth=0.9, zorder=3)
+                    ax.add_feature(cfeature.BORDERS.with_scale('50m'), edgecolor='#334155', linewidth=0.6, linestyle=':', zorder=3)
+                    ax.add_feature(cfeature.LAKES.with_scale('50m'), edgecolor='#0f172a', facecolor='none', linewidth=0.5, zorder=3)
+                except Exception:
+                    ax.coastlines(resolution='110m', color='#0f172a', linewidth=0.8)
 
-        ax.gridlines(draw_labels=False, linewidth=0.4, color='#ffffff', alpha=0.2, linestyle='--')
-    else:
-        ax = fig.add_axes([0.05, 0.10, 0.90, 0.80], facecolor='#0b0f19')
-        lon_mesh, lat_mesh = np.meshgrid(lons, lats)
-        cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both')
-        if geopot_gpdm is not None:
-            cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.2)
-            ax.clabel(cs, inline=True, fmt=contour_label_fmt, fontsize=9, colors='#ffffff')
+                if geopot_gpdm is not None:
+                    cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.3, zorder=4, transform=ccrs.PlateCarree())
+                    ax.clabel(cs, inline=True, fmt=contour_fmt, fontsize=9, colors='#ffffff', inline_spacing=8)
 
-    # Header
-    init_str = run_date.strftime("%a, %d. %b %H:00 UTC")
-    valid_str = valid_date.strftime("%a, %d. %b %H:00 UTC")
-    fig.text(0.03, 0.96, f"localwx PRO  •  DWD ICON-EU (0.0625°)  •  {title_str}", color='#ffffff', fontsize=14, fontweight='bold')
-    fig.text(0.03, 0.925, f"Modell-Lauf: {init_str}   |   Gültig: {valid_str} (+{lead_h:02d}h)", color='#94a3b8', fontsize=11)
+                ax.gridlines(draw_labels=False, linewidth=0.4, color='#ffffff', alpha=0.2, linestyle='--')
+            else:
+                ax = fig.add_axes([0.05, 0.10, 0.90, 0.80], facecolor='#0b0f19')
+                cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both')
+                if geopot_gpdm is not None:
+                    cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.2)
+                    ax.clabel(cs, inline=True, fmt=contour_fmt, fontsize=9, colors='#ffffff')
 
-    # Colorbar
-    cbar_ax = fig.add_axes([0.15, 0.03, 0.70, 0.025])
-    cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal')
-    cbar.ax.tick_params(labelsize=9, colors='#cbd5e1')
-    cbar.set_label(f"Skala ({unit_str})", color='#cbd5e1', fontsize=10, labelpad=-35, x=-0.08)
+            # Titel & Footer
+            init_str = run_date.strftime("%a, %d. %b %H:00 UTC")
+            valid_str = valid_date.strftime("%a, %d. %b %H:00 UTC")
+            fig.text(0.03, 0.96, f"localwx PRO  •  DWD ICON-EU  •  {title_str}", color='#ffffff', fontsize=14, fontweight='bold')
+            fig.text(0.03, 0.925, f"Modell-Lauf: {init_str}   |   Gültig: {valid_str} (+{lead_h:02d}h)", color='#94a3b8', fontsize=11)
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, format='webp', dpi=96, facecolor='#0b0f19', edgecolor='none')
-    plt.close(fig)
-    return True
+            cbar_ax = fig.add_axes([0.15, 0.03, 0.70, 0.025])
+            cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal')
+            cbar.ax.tick_params(labelsize=9, colors='#cbd5e1')
+            cbar.set_label(f"Skala ({unit_str})", color='#cbd5e1', fontsize=10, labelpad=-35, x=-0.08)
+
+            filename = f"frame_{lead_h:03d}.webp"
+            filepath = os.path.join(output_base, p, dom, filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            plt.savefig(filepath, format='webp', dpi=96, facecolor='#0b0f19', edgecolor='none')
+            plt.close(fig)
+
+            generated_frames.append({
+                "param": p,
+                "domain": dom,
+                "lead_h": lead_h,
+                "file": f"{p}/{dom}/{filename}",
+                "valid_time": valid_date.isoformat(),
+                "valid_label": valid_date.strftime("%a %d.%m. %H:%M")
+            })
+
+    return lead_h, generated_frames
 
 
 # ==============================================================================
@@ -296,7 +312,7 @@ def generate_synoptic_dataset():
     start_time = time.time()
     print("🚀 Starte DWD ICON Synoptik- & Modellkarten Generator (localwx PRO)...")
 
-    preload_cartopy_features()
+    setup_cartopy_offline()
 
     output_base = "./dist/synoptic"
     os.makedirs(output_base, exist_ok=True)
@@ -309,7 +325,7 @@ def generate_synoptic_dataset():
     params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
     domains = ['europe', 'germany']
     steps = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 42, 48, 54, 60, 72, 84, 96, 120]
-    print(f"📦 Lade & verarbeite {len(steps)} Zeitschritte (0h bis +120h)...")
+    print(f"📦 Verarbeite {len(steps)} Zeitschritte (0h bis +120h) mit {len(steps)*8} Karten...")
 
     manifest = {
         "model": "DWD ICON-EU",
@@ -324,73 +340,29 @@ def generate_synoptic_dataset():
     }
 
     base_url = f"https://opendata.dwd.de/weather/nwp/icon-eu/grib/{run_str}"
-    render_tasks = []
 
-    # 1. Download & Data Extraction
-    for lead_h in steps:
-        lead_str = f"{lead_h:03d}"
-        url_map = {
-            't850': f"{base_url}/t/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_T.grib2.bz2",
-            'fi850': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_FI.grib2.bz2",
-            'fi500': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_500_FI.grib2.bz2",
-            'fi300': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_FI.grib2.bz2",
-            'pmsl': f"{base_url}/pmsl/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_PMSL.grib2.bz2",
-            'u300': f"{base_url}/u/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_U.grib2.bz2",
-            'v300': f"{base_url}/v/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_V.grib2.bz2",
-            't2m': f"{base_url}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_T_2M.grib2.bz2"
-        }
+    task_args_list = [
+        (lead_h, date_str, run_str, run_date.isoformat(), base_url, output_base)
+        for lead_h in steps
+    ]
 
-        raw_bytes = {}
-        with ThreadPoolExecutor(max_workers=8) as dl_exec:
-            fut_map = {dl_exec.submit(fetch_dwd_file, url): key for key, url in url_map.items()}
-            for fut in as_completed(fut_map):
-                key = fut_map[fut]
-                raw_bytes[key] = fut.result()
+    # Paralleles Rendern der Zeitschritte auf 4 CPU-Cores
+    max_procs = min(os.cpu_count() or 4, 4)
+    print(f"⚡ Starte Multiprocess-Rendering mit {max_procs} Workern...")
 
-        t850_arr, lats, lons = parse_grib_array(raw_bytes.get('t850'))
-        fi850_arr, _, _ = parse_grib_array(raw_bytes.get('fi850'))
-        fi500_arr, _, _ = parse_grib_array(raw_bytes.get('fi500'))
-        fi300_arr, _, _ = parse_grib_array(raw_bytes.get('fi300'))
-        pmsl_arr, _, _ = parse_grib_array(raw_bytes.get('pmsl'))
-        u300_arr, _, _ = parse_grib_array(raw_bytes.get('u300'))
-        v300_arr, _, _ = parse_grib_array(raw_bytes.get('v300'))
-        t2m_arr, _, _ = parse_grib_array(raw_bytes.get('t2m'))
-
-        if lats is None or lons is None:
-            continue
-
-        data_dict = {
-            'lats': lats,
-            'lons': lons,
-            't850': (t850_arr - 273.15) if t850_arr is not None else None,
-            'fi850': (fi850_arr / 98.0665) if fi850_arr is not None else None,
-            'fi500': (fi500_arr / 98.0665) if fi500_arr is not None else None,
-            'fi300': (fi300_arr / 98.0665) if fi300_arr is not None else None,
-            'pmsl': (pmsl_arr / 100.0) if pmsl_arr is not None else None,
-            'jet300': (np.sqrt(u300_arr**2 + v300_arr**2) * 3.6) if (u300_arr is not None and v300_arr is not None) else None,
-            't2m': (t2m_arr - 273.15) if t2m_arr is not None else None
-        }
-
-        valid_dt = run_date + timedelta(hours=lead_h)
-        for p in params:
-            for dom in domains:
-                filename = f"frame_{lead_h:03d}.webp"
-                filepath = os.path.join(output_base, p, dom, filename)
-                
-                render_tasks.append((p, dom, lead_h, run_date.isoformat(), data_dict, filepath))
-                
-                manifest["frames"][p][dom].append({
-                    "lead_h": lead_h,
-                    "file": f"{p}/{dom}/{filename}",
-                    "valid_time": valid_dt.isoformat(),
-                    "valid_label": valid_dt.strftime("%a %d.%m. %H:%M")
-                })
-
-    # 2. Paralleles Multiprocess-Rendering
-    print(f"🎨 Rendere {len(render_tasks)} Modellkarten parallel auf allen CPU-Kernen...")
-    workers = min(os.cpu_count() or 4, 8)
-    with ProcessPoolExecutor(max_workers=workers) as renderer:
-        list(renderer.map(render_single_chart_task, render_tasks))
+    with ProcessPoolExecutor(max_workers=max_procs) as executor:
+        futures = {executor.submit(render_step_task, args): args[0] for args in task_args_list}
+        completed = 0
+        for future in as_completed(futures):
+            lead_h = futures[future]
+            try:
+                _, frames = future.result()
+                for f in frames:
+                    manifest["frames"][f["param"]][f["domain"]].append(f)
+                completed += 1
+                print(f"   ↳ [{completed}/{len(steps)}] Zeitschritt +{lead_h:02d}h fertiggestellt.")
+            except Exception as e:
+                print(f"⚠️ Fehler bei Zeitschritt +{lead_h}h: {e}")
 
     for p in params:
         for dom in domains:
@@ -401,7 +373,7 @@ def generate_synoptic_dataset():
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     duration = round(time.time() - start_time, 1)
-    print(f"✅ Alle {len(render_tasks)} synoptischen Modellkarten in {duration}s fertiggestellt!")
+    print(f"✅ Alle 168 synoptischen Modellkarten in {duration}s erfolgreich generiert!")
 
     upload_synoptic_to_ftp(output_base)
 
