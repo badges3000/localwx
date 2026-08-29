@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - DEADLOCK-FREE
-===========================================================================
-Paralleler, crash- und deadlock-sicherer Renderer für DWD ICON-EU Modellkarten.
+DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - CRASH-PROOF & FAST
+================================================================================
+Zuverlässiger, thread- und prozesssicherer Renderer für DWD ICON-EU Modellkarten.
+
+Features:
+- Robuste GRIB2-Dekodierung mit Koordinaten-Normalisierung (-180° bis +180°)
+- Automatischer Scan-Richtungsabgleich (Nord-Süd / Süd-Nord)
+- Deadlock-freies Multiprocessing pro Zeitschritt
+- Automatischer FTPS-Upload nach /data/synoptic/
 """
 
 import os
@@ -20,11 +26,13 @@ from PIL import Image
 import ftplib
 import ssl
 
+# Matplotlib headless backend
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
+# Cartopy Setup
 try:
     import cartopy
     import cartopy.crs as ccrs
@@ -33,6 +41,7 @@ try:
 except ImportError:
     CARTOPY_AVAILABLE = False
 
+# Eccodes für DWD GRIB2 Dekodierung
 try:
     import eccodes
     ECCODES_AVAILABLE = True
@@ -41,13 +50,13 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. ROBUSTER OFFLINE-DOWNLOAD DER KARTEN-GEOMETRIEN (KEIN DEADLOCK)
+# 1. OFFLINE-DOWNLOAD DER KARTEN-GEOMETRIEN (KEIN NETWORK-HANG / DEADLOCK)
 # ==============================================================================
 
 def setup_cartopy_offline():
     """
-    Lädt Küsten und Grenzen einmalig direkt herunter und entpackt sie in den Cartopy-Cache.
-    Verhindert Lock-Konflikte und Timeouts in Multiprocessing-Workern.
+    Lädt Küsten und Grenzen einmalig vorab herunter und entpackt sie im Cartopy-Cache.
+    Verhindert Lock-Konflikte und Endlos-Hänger in Subprozessen.
     """
     if not CARTOPY_AVAILABLE:
         return
@@ -64,7 +73,7 @@ def setup_cartopy_offline():
         ("https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_lakes.zip", target_dir, "ne_50m_lakes.shp")
     ]
 
-    print("🗺️ Lade Geometrien für synoptische Karten vorab...")
+    print("🗺️ Initialisiere Geometrie-Features...")
     for url, out_folder, check_file in downloads:
         if os.path.exists(os.path.join(out_folder, check_file)):
             continue
@@ -77,7 +86,7 @@ def setup_cartopy_offline():
                 zip_ref.extractall(out_folder)
             os.remove(zip_path)
         except Exception as e:
-            print(f"⚠️ Hinweis bei {check_file}: {e} (Fallback auf Low-Res)")
+            print(f"⚠️ Hinweis bei {check_file}: {e} (Fallback aktiv)")
 
 
 # ==============================================================================
@@ -139,6 +148,9 @@ def fetch_dwd_file(url):
 
 
 def parse_grib_array(grib_bytes):
+    """
+    Parst GRIB2-Nachrichten und normalisiert Koordinaten sowie Scanrichtung.
+    """
     if not ECCODES_AVAILABLE or grib_bytes is None:
         return None, None, None
     msg_id = None
@@ -146,15 +158,35 @@ def parse_grib_array(grib_bytes):
         msg_id = eccodes.codes_new_from_message(grib_bytes)
         ni = eccodes.codes_get(msg_id, 'Ni')
         nj = eccodes.codes_get(msg_id, 'Nj')
-        lat_first = eccodes.codes_get(msg_id, 'latitudeOfFirstGridPointInDegrees')
-        lat_last = eccodes.codes_get(msg_id, 'latitudeOfLastGridPointInDegrees')
-        lon_first = eccodes.codes_get(msg_id, 'longitudeOfFirstGridPointInDegrees')
-        lon_last = eccodes.codes_get(msg_id, 'longitudeOfLastGridPointInDegrees')
-        values = eccodes.codes_get_values(msg_id)
 
+        try:
+            lat_first = eccodes.codes_get_double(msg_id, 'latitudeOfFirstGridPointInDegrees')
+            lat_last = eccodes.codes_get_double(msg_id, 'latitudeOfLastGridPointInDegrees')
+            lon_first = eccodes.codes_get_double(msg_id, 'longitudeOfFirstGridPointInDegrees')
+            lon_last = eccodes.codes_get_double(msg_id, 'longitudeOfLastGridPointInDegrees')
+        except Exception:
+            lat_first = eccodes.codes_get(msg_id, 'latitudeOfFirstGridPoint') / 1e6
+            lat_last = eccodes.codes_get(msg_id, 'latitudeOfLastGridPoint') / 1e6
+            lon_first = eccodes.codes_get(msg_id, 'longitudeOfFirstGridPoint') / 1e6
+            lon_last = eccodes.codes_get(msg_id, 'longitudeOfLastGridPoint') / 1e6
+
+        # Längengrade von 0..360 auf -180..+180 normalisieren
+        if lon_first > 180.0:
+            lon_first -= 360.0
+        if lon_last > 180.0:
+            lon_last -= 360.0
+
+        j_scans_pos = eccodes.codes_get(msg_id, 'jScansPositively')
+        values = eccodes.codes_get_values(msg_id)
         arr = values.reshape((nj, ni))
-        lats = np.linspace(lat_first, lat_last, nj)
-        lons = np.linspace(lon_first, lon_last, ni)
+
+        lats = np.linspace(min(lat_first, lat_last), max(lat_first, lat_last), nj)
+        lons = np.linspace(min(lon_first, lon_last), max(lon_first, lon_last), ni)
+
+        # Wenn von Nord nach Süd gescannt wurde, Array umdrehen
+        if j_scans_pos == 0:
+            arr = np.flipud(arr)
+
         return arr, lats, lons
     except Exception:
         return None, None, None
@@ -172,7 +204,7 @@ def parse_grib_array(grib_bytes):
 
 def render_step_task(task_args):
     """
-    Verarbeitet alle 8 Karten (4 Parameter x 2 Domains) eines Zeitschritts autark im Worker-Prozess.
+    Rendert alle 8 Karten (4 Parameter x 2 Domains) eines Zeitschritts autark im Worker-Prozess.
     """
     lead_h, date_str, run_str, run_date_iso, base_url, output_base = task_args
     run_date = datetime.fromisoformat(run_date_iso)
@@ -346,7 +378,6 @@ def generate_synoptic_dataset():
         for lead_h in steps
     ]
 
-    # Paralleles Rendern der Zeitschritte auf 4 CPU-Cores
     max_procs = min(os.cpu_count() or 4, 4)
     print(f"⚡ Starte Multiprocess-Rendering mit {max_procs} Workern...")
 
