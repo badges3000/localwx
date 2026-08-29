@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - CRASH-PROOF & FAST
-================================================================================
-Zuverlässiger, thread-sicherer Renderer für echte DWD ICON-EU GRIB2-Modellkarten.
+DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - CRASH-PROOF & TURBO
+=================================================================================
+Zuverlässiger, paralleler Multiprocess-Renderer für echte DWD ICON-EU GRIB2-Karten.
 
-Architektur:
-- ThreadPoolExecutor NUR für parallele I/O (DWD HTTP Downloads)
-- Thread-sicheres Rendering ohne C-Library Race Conditions (kein Segfault)
-- Sauberes Eccodes Memory-Management (garantiertes codes_release)
-- Automatische Wiederholungsversuche bei Netzwerkfehlern
-- Laufzeit: ca. 35-50 Sekunden für alle Parameter (0h bis +120h)
+Features:
+- Robuster, zeitbegrenzter Pre-Fetch für Cartopy-Features (Kein Hang bei Natural Earth)
+- Parallelisiertes Chart-Rendering via ProcessPoolExecutor
+- Sauberes Eccodes Memory-Management
+- 100% thread- & process-safe
+- Upload per FTPS nach /data/synoptic/
 """
 
 import os
@@ -20,7 +20,8 @@ import bz2
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import numpy as np
 from PIL import Image
 import ftplib
@@ -32,15 +33,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-# Cartopy für echte europäische Küstenlinien & Grenzen
+# Cartopy Pre-Check & Feature Setup
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
+    import cartopy.io.shapereader as shpreader
     CARTOPY_AVAILABLE = True
 except ImportError:
     CARTOPY_AVAILABLE = False
 
-# Eccodes für DWD GRIB2 Dekodierung
 try:
     import eccodes
     ECCODES_AVAILABLE = True
@@ -93,6 +94,37 @@ JET_CMAP = get_localwx_jet_cmap()
 
 
 # ==============================================================================
+# CARTOPY FEATURE PRE-FETCH (KEIN NETWORK HANG)
+# ==============================================================================
+
+def preload_cartopy_features():
+    """
+    Lädt die benötigten Cartopy Natural Earth Features vorab mit striktem Timeout.
+    Verhindert Hängenbleiben bei überlasteten Amazon S3 Mirrors.
+    """
+    if not CARTOPY_AVAILABLE:
+        return
+
+    print("🗺️ Initialisiere Geometrie-Features...")
+    socket_default_timeout = 10
+    import socket
+    socket.setdefaulttimeout(socket_default_timeout)
+
+    for feature_name, category, name in [
+        ('Coastline', 'physical', 'coastline'),
+        ('Borders', 'cultural', 'admin_0_boundary_lines_land'),
+        ('Lakes', 'physical', 'lakes')
+    ]:
+        try:
+            shpreader.natural_earth(resolution='50m', category=category, name=name)
+        except Exception:
+            try:
+                shpreader.natural_earth(resolution='110m', category=category, name=name)
+            except Exception as e:
+                print(f"⚠️ Hinweis bei {feature_name}: {e} (Fallback aktiv)")
+
+
+# ==============================================================================
 # DWD GRIB2 DOWNLOAD & PARSING
 # ==============================================================================
 
@@ -118,7 +150,7 @@ def fetch_dwd_file(url):
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (localwx PRO)'})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 compressed = resp.read()
                 return bz2.decompress(compressed)
         except Exception:
@@ -155,10 +187,12 @@ def parse_grib_array(grib_bytes):
 
 
 # ==============================================================================
-# THREAD-SICHERES METEOROLOGISCHES KARTEN-RENDERING
+# WORKER FUNKTION FÜR MULTIPROCESSING RENDERING
 # ==============================================================================
 
-def render_chart(param, domain, lead_h, run_date, data_dict, output_path):
+def render_single_chart_task(task_args):
+    param, domain, lead_h, run_date_iso, data_dict, output_path = task_args
+    run_date = datetime.fromisoformat(run_date_iso)
     valid_date = run_date + timedelta(hours=lead_h)
     lats, lons = data_dict['lats'], data_dict['lons']
 
@@ -216,10 +250,12 @@ def render_chart(param, domain, lead_h, run_date, data_dict, output_path):
         lon_mesh, lat_mesh = np.meshgrid(lons, lats)
         cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both', transform=ccrs.PlateCarree())
 
-        # Cartopy Features (50m Skalierung)
-        ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='#0f172a', linewidth=0.9, zorder=3)
-        ax.add_feature(cfeature.BORDERS.with_scale('50m'), edgecolor='#334155', linewidth=0.6, linestyle=':', zorder=3)
-        ax.add_feature(cfeature.LAKES.with_scale('50m'), edgecolor='#0f172a', facecolor='none', linewidth=0.5, zorder=3)
+        try:
+            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='#0f172a', linewidth=0.9, zorder=3)
+            ax.add_feature(cfeature.BORDERS.with_scale('50m'), edgecolor='#334155', linewidth=0.6, linestyle=':', zorder=3)
+            ax.add_feature(cfeature.LAKES.with_scale('50m'), edgecolor='#0f172a', facecolor='none', linewidth=0.5, zorder=3)
+        except Exception:
+            ax.coastlines(resolution='110m', color='#0f172a', linewidth=0.8)
 
         if geopot_gpdm is not None:
             cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.3, zorder=4, transform=ccrs.PlateCarree())
@@ -249,17 +285,18 @@ def render_chart(param, domain, lead_h, run_date, data_dict, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, format='webp', dpi=96, facecolor='#0b0f19', edgecolor='none')
     plt.close(fig)
-    plt.close('all')
-    return output_path
+    return True
 
 
 # ==============================================================================
-# PIPELINE GENERATOR (SICHER & SCHNELL)
+# PIPELINE GENERATOR
 # ==============================================================================
 
 def generate_synoptic_dataset():
     start_time = time.time()
     print("🚀 Starte DWD ICON Synoptik- & Modellkarten Generator (localwx PRO)...")
+
+    preload_cartopy_features()
 
     output_base = "./dist/synoptic"
     os.makedirs(output_base, exist_ok=True)
@@ -271,10 +308,8 @@ def generate_synoptic_dataset():
 
     params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
     domains = ['europe', 'germany']
-    
-    # 21 ausgewählte Zeitschritte für die gesamten 5 Tage (+120h)
     steps = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 42, 48, 54, 60, 72, 84, 96, 120]
-    print(f"📦 Verarbeite {len(steps)} Zeitschritte (0h bis +120h) für alle Parameter...")
+    print(f"📦 Lade & verarbeite {len(steps)} Zeitschritte (0h bis +120h)...")
 
     manifest = {
         "model": "DWD ICON-EU",
@@ -289,12 +324,11 @@ def generate_synoptic_dataset():
     }
 
     base_url = f"https://opendata.dwd.de/weather/nwp/icon-eu/grib/{run_str}"
+    render_tasks = []
 
+    # 1. Download & Data Extraction
     for lead_h in steps:
         lead_str = f"{lead_h:03d}"
-        step_t0 = time.time()
-
-        # 1. Paralleler Download aller benötigten GRIBs für diesen Zeitschritt
         url_map = {
             't850': f"{base_url}/t/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_T.grib2.bz2",
             'fi850': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_FI.grib2.bz2",
@@ -313,7 +347,6 @@ def generate_synoptic_dataset():
                 key = fut_map[fut]
                 raw_bytes[key] = fut.result()
 
-        # 2. Dekodieren
         t850_arr, lats, lons = parse_grib_array(raw_bytes.get('t850'))
         fi850_arr, _, _ = parse_grib_array(raw_bytes.get('fi850'))
         fi500_arr, _, _ = parse_grib_array(raw_bytes.get('fi500'))
@@ -324,17 +357,7 @@ def generate_synoptic_dataset():
         t2m_arr, _, _ = parse_grib_array(raw_bytes.get('t2m'))
 
         if lats is None or lons is None:
-            lats = np.linspace(70.0, 32.0, 180)
-            lons = np.linspace(-22.0, 42.0, 240)
-            lon_g, lat_g = np.meshgrid(lons, lats)
-            t850_arr = 16.0 - (lat_g - 40.0) * 0.9 + 273.15
-            fi850_arr = 145.0 * 98.0665
-            fi500_arr = 550.0 * 98.0665
-            fi300_arr = 920.0 * 98.0665
-            pmsl_arr = 1015.0 * 100.0
-            u300_arr = np.zeros_like(lon_g) + 30.0
-            v300_arr = np.zeros_like(lon_g) + 20.0
-            t2m_arr = t850_arr + 6.0
+            continue
 
         data_dict = {
             'lats': lats,
@@ -348,13 +371,13 @@ def generate_synoptic_dataset():
             't2m': (t2m_arr - 273.15) if t2m_arr is not None else None
         }
 
-        # 3. Rendern (Sequentiell für diesen Zeitschritt = 100% thread-sicher & superschnell)
         valid_dt = run_date + timedelta(hours=lead_h)
         for p in params:
             for dom in domains:
                 filename = f"frame_{lead_h:03d}.webp"
                 filepath = os.path.join(output_base, p, dom, filename)
-                render_chart(p, dom, lead_h, run_date, data_dict, filepath)
+                
+                render_tasks.append((p, dom, lead_h, run_date.isoformat(), data_dict, filepath))
                 
                 manifest["frames"][p][dom].append({
                     "lead_h": lead_h,
@@ -363,8 +386,11 @@ def generate_synoptic_dataset():
                     "valid_label": valid_dt.strftime("%a %d.%m. %H:%M")
                 })
 
-        step_dur = round(time.time() - step_t0, 1)
-        print(f"  ✓ Zeitschritt +{lead_h:02d}h fertiggestellt ({step_dur}s).")
+    # 2. Paralleles Multiprocess-Rendering
+    print(f"🎨 Rendere {len(render_tasks)} Modellkarten parallel auf allen CPU-Kernen...")
+    workers = min(os.cpu_count() or 4, 8)
+    with ProcessPoolExecutor(max_workers=workers) as renderer:
+        list(renderer.map(render_single_chart_task, render_tasks))
 
     for p in params:
         for dom in domains:
@@ -375,7 +401,7 @@ def generate_synoptic_dataset():
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     duration = round(time.time() - start_time, 1)
-    print(f"✅ Echte synoptische Modellkarten erfolgreich in {duration}s generiert!")
+    print(f"✅ Alle {len(render_tasks)} synoptischen Modellkarten in {duration}s fertiggestellt!")
 
     upload_synoptic_to_ftp(output_base)
 
@@ -442,7 +468,7 @@ def upload_synoptic_to_ftp(local_dir):
                 ftp.cwd('..')
 
     ftp.quit()
-    print(f"✅ {uploaded_count} echte Synoptik-Dateien erfolgreich nach data/synoptic/ hochgeladen!")
+    print(f"✅ {uploaded_count} synoptische Modellkarten erfolgreich nach data/synoptic/ hochgeladen!")
 
 
 if __name__ == "__main__":
