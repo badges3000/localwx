@@ -49,11 +49,31 @@ def get_latest_icon_eu_reference_time():
     return ref_date
 
 
+# DWD GeoServer WMS Palette -> RADOLAN Turbo Palette Mapping
+# Mappt jede DWD-Farbstufe exakt auf das Design von generate_radar.py:
+# Niesel (Türkis) -> Leicht/Mäßig (Grün) -> Mäßig/Stark (Gelb) -> Stark (Orange/Rot) -> Unwetter (Magenta/Weiß)
+DWD_WMS_COLOR_MAP = [
+    # (r, g, b) DWD WMS               -> [r, g, b, a] Turbo Radar
+    ((192, 192, 192), [35, 190, 240, 175]),   # Trace Niesel (0.01 - 0.1 mm) -> Feiner Türkis
+    ((254, 254, 192), [40, 200, 240, 210]),   # 0.1 - 0.2 mm -> Zarter Türkis
+    ((254, 254, 91),  [45, 215, 210, 240]),   # 0.2 - 0.5 mm -> Mint-Türkis
+    ((207, 242, 0),   [60, 225, 100, 255]),   # 0.5 - 1.0 mm -> Helles Lime-Grün
+    ((160, 214, 37),  [45, 218, 70, 255]),    # 1.0 - 2.0 mm -> Frisches Grasgrün
+    ((54, 201, 105),  [34, 197, 94, 255]),    # 2.0 - 5.0 mm -> Sattes Smaragdgrün
+    ((0, 215, 215),   [245, 205, 20, 255]),   # 5.0 - 10.0 mm -> Leuchtendes Goldgelb
+    ((0, 166, 221),   [250, 165, 15, 255]),   # 10.0 - 20.0 mm -> Warmes Sonnengelb/Orange
+    ((0, 0, 254),     [245, 100, 20, 255]),   # 20.0 - 35.0 mm -> Kräftiges Orange-Rot
+    ((151, 48, 194),  [230, 40, 40, 255]),    # 35.0 - 50.0 mm -> Karminrot
+    ((217, 38, 199),  [195, 20, 35, 255]),    # 50.0 - 75.0 mm -> Tiefes Scharlachrot
+    ((254, 0, 0),     [215, 50, 220, 255]),   # 75.0 - 100.0 mm -> Leuchtendes Magenta
+    ((160, 0, 0),     [250, 200, 255, 255]),  # > 100 mm -> Extremes Weiß-Violett
+]
+
+
 def recolor_wms_to_turbo(img_rgba):
     """
-    Wandelt DWD ICON-EU WMS-Niederschlag in echte Google Turbo-Farben um.
-    Garantiert 100% transparenten Hintergrund überall wo es trocken ist!
-    Farbstufen: Tiefblau -> Türkis -> Smaragdgrün -> Goldgelb -> Orange-Rot -> Magenta
+    Wandelt die DWD ICON-EU WMS-Farben exakt in die aus generate_radar.py bekannten
+    Turbo-Radar-Farben um (Türkis -> Grün -> Goldgelb -> Orange -> Rot -> Magenta).
     """
     arr = np.array(img_rgba)
     h, w, c = arr.shape
@@ -65,45 +85,43 @@ def recolor_wms_to_turbo(img_rgba):
     b = arr[:, :, 2].astype(int)
     a = arr[:, :, 3].astype(int)
 
-    # Farbvarianz berechnen (Grau-/Schwarztöne des Hintergrunds ausschließen)
-    max_c = np.maximum(np.maximum(r, g), b)
-    min_c = np.minimum(np.minimum(r, g), b)
-    delta = max_c - min_c
-
-    # Echtes Regensignal hat Farbe (delta > 20) und ist nicht rein grau/schwarz/weiß
-    has_rain = (a > 40) & (delta > 20) & (max_c > 35)
-
     new_rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
-    # 1. Nieselregen (Tiefblau: 0.1 - 0.5 mm/3h)
-    mask_blue = has_rain & (b > r + 30) & (b > g)
-    new_rgba[mask_blue] = [46, 98, 216, 190]
+    # Hintergrund / Nicht-Niederschlag (Transparenz oder reines Weiß / Schwarz / Grau)
+    max_c = np.maximum(np.maximum(r, g), b)
+    min_c = np.minimum(np.minimum(r, g), b)
+    is_bg = (a < 30) | ((max_c > 250) & (min_c > 240)) | ((max_c < 25) & (min_c < 25))
 
-    # 2. Leichter Regen (Türkis / Cyan: 0.5 - 2.0 mm/3h)
-    mask_cyan = has_rain & (g > r + 15) & (b > 130) & ~mask_blue
-    new_rgba[mask_cyan] = [54, 170, 253, 215]
+    # Ordne jedem Pixel die am besten passende DWD-WMS-Klasse zu
+    for (dwd_r, dwd_g, dwd_b), turbo_rgba in DWD_WMS_COLOR_MAP:
+        dist_sq = (r - dwd_r)**2 + (g - dwd_g)**2 + (b - dwd_b)**2
+        # Exakter Match oder minimale Antialiasing-Toleranz
+        mask = (~is_bg) & (dist_sq < 28**2)
+        new_rgba[mask] = turbo_rgba
 
-    # 3. Mäßiger Regen (Smaragd / Frisches Lime-Grün: 2.0 - 5.0 mm/3h)
-    mask_green = has_rain & (g > r) & (g > b) & ~mask_blue & ~mask_cyan
-    new_rgba[mask_green] = [34, 197, 94, 235]
-
-    # 4. Kräftiger Regen (Goldgelb: 5.0 - 10.0 mm/3h)
-    mask_yellow = has_rain & (r > 170) & (g > 150) & (b < 120) & ~mask_green
-    new_rgba[mask_yellow] = [251, 182, 55, 250]
-
-    # 5. Starkregen (Leuchtendes Orange / Karminrot: 10.0 - 25.0 mm/3h)
-    mask_orange_red = has_rain & (r > 180) & (g < 140) & (b < 90)
-    new_rgba[mask_orange_red] = [234, 92, 25, 255]
-
-    # 6. Unwetter / Hagel (Magenta / Violett: > 25 mm/3h)
-    mask_purple = has_rain & (r > 130) & (b > 130) & (g < 120)
-    new_rgba[mask_purple] = [217, 70, 239, 255]
-
-    # Unklassifizierter Rest mit Regensignal -> sauberes Mint-Grün
-    unclassified = has_rain & (new_rgba[:, :, 3] == 0)
-    new_rgba[unclassified] = [26, 228, 182, 210]
+    # Ränder mit interpolierten Farben: Nächster Nachbar unter den Klassen
+    unmatched = (~is_bg) & (new_rgba[:, :, 3] == 0)
+    if np.any(unmatched):
+        best_dist = np.full((h, w), 1e9, dtype=np.float32)
+        best_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        
+        for (dwd_r, dwd_g, dwd_b), turbo_rgba in DWD_WMS_COLOR_MAP:
+            d = (r - dwd_r)**2 + (g - dwd_g)**2 + (b - dwd_b)**2
+            closer = unmatched & (d < best_dist)
+            best_dist[closer] = d[closer]
+            best_rgba[closer] = turbo_rgba
+            
+        new_rgba[unmatched] = best_rgba[unmatched]
 
     return Image.fromarray(new_rgba, mode='RGBA')
+
+
+def lat_lon_to_web_mercator(lat, lon):
+    """Konvertiert WGS84 Lat/Lon in EPSG:3857 Web-Mercator Koordinaten (in Metern)."""
+    r = 6378137.0
+    x = lon * (np.pi / 180.0) * r
+    y = np.log(np.tan((np.pi / 4.0) + (np.radians(lat) / 2.0))) * r
+    return x, y
 
 
 def generate_europe_dataset():
@@ -120,6 +138,13 @@ def generate_europe_dataset():
     total_steps = 40  # 40 * 3h = 120 Stunden
     step_hours = 3
 
+    # Exakte Web-Mercator Bounding Box für ganz Europa
+    min_lat, min_lon = EUROPE_BOUNDS[0]
+    max_lat, max_lon = EUROPE_BOUNDS[1]
+    min_x, min_y = lat_lon_to_web_mercator(min_lat, min_lon)
+    max_x, max_y = lat_lon_to_web_mercator(max_lat, max_lon)
+    merc_bbox_str = f"{min_x:.2f},{min_y:.2f},{max_x:.2f},{max_y:.2f}"
+
     steps = []
     for i in range(total_steps):
         valid_dt = ref_date + timedelta(hours=(i + 1) * step_hours)
@@ -132,17 +157,14 @@ def generate_europe_dataset():
         file_name = f"europe_{step_idx:03d}.webp"
         file_path = os.path.join(output_dir, file_name)
 
-        # DWD Geoserver WMS für ICON-EU 3h Niederschlag
-        min_lat, min_lon = EUROPE_BOUNDS[0]
-        max_lat, max_lon = EUROPE_BOUNDS[1]
-        
+        # DWD Geoserver WMS für ICON-EU 3h Niederschlag - Nativ in EPSG:3857 (Web Mercator)
         wms_url = (
             f"https://maps.dwd.de/geoserver/dwd/wms?"
             f"SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&"
             f"LAYERS=dwd:Icon-eu_reg00625_fd_sl_TOTPREC03H&"
-            f"STYLES=&CRS=EPSG:4326&"
-            f"BBOX={min_lat},{min_lon},{max_lat},{max_lon}&"
-            f"WIDTH=1200&HEIGHT=1000&"
+            f"STYLES=&CRS=EPSG:3857&"
+            f"BBOX={merc_bbox_str}&"
+            f"WIDTH=1400&HEIGHT=1100&"
             f"FORMAT=image/png&TRANSPARENT=TRUE&"
             f"TIME={valid_iso}&DIM_REFERENCE_TIME={ref_iso}"
         )
