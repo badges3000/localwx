@@ -424,11 +424,80 @@ def apply_temporal_consistency_filter(grid_list):
         return grid_list
 
 
-def fetch_and_parse_konrad3d(output_dir):
+def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius_km=35):
+    """
+    Intelligentes Boden-Snapping:
+    Sucht im Umkreis von bis zu 35 km um den 3D-Höhenschwerpunkt der Gewitterzelle
+    nach dem tatsächlichen Starkregen-/Reflektivitätskern am Boden im RADOLAN-Raster.
+    Gibt (lat_ground, lon_ground, d_lat, d_lon) zurück.
+    """
+    if surface_grid is None:
+        return lat_aloft, lon_aloft, 0.0, 0.0
+
+    try:
+        R = 6370.040
+        lat_ts = np.radians(60.0)
+        lon_0 = np.radians(10.0)
+        scale = R * (1.0 + np.sin(lat_ts))
+
+        phi = np.radians(lat_aloft)
+        lam = np.radians(lon_aloft)
+        m = scale / (1.0 + np.sin(phi))
+        xp = m * np.cos(phi) * np.sin(lam - lon_0)
+        yp = -m * np.cos(phi) * np.cos(lam - lon_0)
+
+        cx = int(round(xp + 543.197))
+        cy = int(round(yp + 4822.589))
+
+        h, w = surface_grid.shape
+        r_px = int(round(search_radius_km))
+        xmin = max(0, cx - r_px)
+        xmax = min(w - 1, cx + r_px)
+        ymin = max(0, cy - r_px)
+        ymax = min(h - 1, cy + r_px)
+
+        window = surface_grid[ymin:ymax+1, xmin:xmax+1]
+        max_val = np.max(window) if window.size > 0 else 0
+
+        # Nur snappen, wenn im Umkreis tatsächlich ein relevanter Niederschlagskern (>= 15) existiert
+        if max_val >= 15:
+            threshold = max(15, int(0.6 * max_val))
+            mask = window >= threshold
+            y_indices, x_indices = np.where(mask)
+            weights = window[mask].astype(np.float64)
+            
+            if np.sum(weights) > 0:
+                x_ground = np.sum(x_indices * weights) / np.sum(weights) + xmin
+                y_ground = np.sum(y_indices * weights) / np.sum(weights) + ymin
+
+                # Rückprojektion auf WGS84
+                xp_g = x_ground - 543.197
+                yp_g = y_ground - 4822.589
+                d = np.sqrt(xp_g * xp_g + yp_g * yp_g)
+                phi_g = np.pi / 2.0 - 2.0 * np.arctan(d / scale)
+                lam_g = lon_0 + np.arctan2(xp_g, -yp_g)
+                
+                lat_ground = np.degrees(phi_g)
+                lon_ground = np.degrees(lam_g)
+
+                d_lat = lat_ground - lat_aloft
+                d_lon = lon_ground - lon_aloft
+                
+                dist_km = np.sqrt(((d_lat * 111.32) ** 2) + ((d_lon * 111.32 * np.cos(np.radians(lat_aloft))) ** 2))
+                if dist_km <= 40.0:
+                    return lat_ground, lon_ground, d_lat, d_lon
+    except Exception as e:
+        print(f"Hinweis beim Boden-Snapping: {e}")
+
+    return lat_aloft, lon_aloft, 0.0, 0.0
+
+
+def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
     """
     Lädt das neueste DWD KONRAD3D (3D-Zelltracking) XML von opendata.dwd.de herunter
     und erzeugt ein optimiertes cells.json mit allen aktiven Gewitterzellen,
     Zugbahnen, Hagel-Flags, dBZ-Werten und Geschwindigkeiten.
+    Wendet intelligentes Boden-Snapping auf das sichtbare RADOLAN-Bodenradar an.
     """
     print("⚡ Rufe aktuelle DWD KONRAD3D Gewitter- & Hagelzell-Daten ab...")
     cells_data = {
@@ -628,6 +697,18 @@ def fetch_and_parse_konrad3d(output_dir):
                     dist_km = np.sqrt((d_lat * 111.32)**2 + (d_lon * 111.32)**2)
                     speed = round(dist_km / (first_pt["lead_time_min"] / 60.0), 1)
 
+            # 7. Boden-Snapping: Zentriere Marker, Polygon & Zugbahn auf den tatsächlichen Boden-Radarkern
+            lat_ground, lon_ground, d_lat, d_lon = snap_cell_to_surface_radar(lat, lon, surface_grid)
+            if abs(d_lat) > 0.0001 or abs(d_lon) > 0.0001:
+                dist_corr = np.sqrt(((d_lat * 111.32) ** 2) + ((d_lon * 111.32 * np.cos(np.radians(lat))) ** 2))
+                print(f"🎯 Boden-Snapping Zelle #{feat_id}: Versatz {dist_corr:.1f} km korrigiert -> Boden-Position: Lat={lat_ground:.5f}, Lon={lon_ground:.5f}")
+                lat = round(lat_ground, 5)
+                lon = round(lon_ground, 5)
+                if polygon_coords:
+                    polygon_coords = [[round(p[0] + d_lat, 5), round(p[1] + d_lon, 5)] for p in polygon_coords]
+                if forecast_track:
+                    forecast_track = [{**pt, "lat": round(pt["lat"] + d_lat, 5), "lon": round(pt["lon"] + d_lon, 5)} for pt in forecast_track]
+
             # Farb- & Gefahrenklassifikation
             level = "moderate"
             level_name = "Mäßiges Gewitter"
@@ -806,8 +887,9 @@ def generate_radar_dataset():
     frames_metadata.sort(key=lambda x: x['step'])
     print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
 
-    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen
-    cells_result = fetch_and_parse_konrad3d(output_dir)
+    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen (mit Boden-Snapping auf das neueste Boden-Radar)
+    latest_surface_grid = raw_history_items[-1]['grid'] if raw_history_items else (cleaned_grids[-1] if cleaned_grids else None)
+    cells_result = fetch_and_parse_konrad3d(output_dir, surface_grid=latest_surface_grid)
 
     metadata = {
         "model": "DWD RADOLAN HD",
