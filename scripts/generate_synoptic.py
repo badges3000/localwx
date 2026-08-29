@@ -313,7 +313,7 @@ def render_step_task(task_args):
             # Titel & Header
             init_str = run_date.strftime("%a, %d. %b %H:00 UTC")
             valid_str = valid_date.strftime("%a, %d. %b %H:00 UTC")
-            fig.text(0.03, 0.96, f"localwx PRO  •  DWD ICON-EU  •  {title_str}", color='#ffffff', fontsize=14, fontweight='bold')
+            fig.text(0.03, 0.96, f"localwx.de  •  DWD ICON-EU  •  {title_str}", color='#ffffff', fontsize=14, fontweight='bold')
             fig.text(0.03, 0.925, f"Modell-Lauf: {init_str}   |   Gültig: {valid_str} (+{lead_h:02d}h)", color='#94a3b8', fontsize=11)
 
             # Colorbar
