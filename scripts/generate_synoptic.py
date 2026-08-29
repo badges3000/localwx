@@ -7,6 +7,7 @@ Zuverlässiger, thread- und prozesssicherer Renderer für DWD ICON-EU Modellkart
 Features:
 - Robuste GRIB2-Dekodierung mit Koordinaten-Normalisierung (-180° bis +180°)
 - Automatischer Scan-Richtungsabgleich (Nord-Süd / Süd-Nord)
+- Breite 16:10 / 16:9 Mitteleuropa-Ansicht ohne schwarze Seitenränder
 - Deadlock-freies Multiprocessing pro Zeitschritt
 - Automatischer FTPS-Upload nach /data/synoptic/
 """
@@ -282,8 +283,10 @@ def render_step_task(task_args):
             if CARTOPY_AVAILABLE:
                 ax = fig.add_axes([0.02, 0.08, 0.96, 0.83], projection=proj)
                 if dom == 'germany':
-                    ax.set_extent([4.5, 16.5, 46.5, 55.8], crs=ccrs.PlateCarree())
+                    # Breite Mitteleuropa-Ansicht im 16:10 Format (füllt den Frame voll aus)
+                    ax.set_extent([1.5, 19.5, 45.8, 56.2], crs=ccrs.PlateCarree())
                 else:
+                    # Europa-Gesamtansicht
                     ax.set_extent([-16.0, 36.0, 34.0, 68.0], crs=ccrs.PlateCarree())
 
                 cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both', transform=ccrs.PlateCarree())
@@ -307,12 +310,13 @@ def render_step_task(task_args):
                     cs = ax.contour(lon_mesh, lat_mesh, geopot_gpdm, levels=contour_levels, colors='#ffffff', linewidths=1.2)
                     ax.clabel(cs, inline=True, fmt=contour_fmt, fontsize=9, colors='#ffffff')
 
-            # Titel & Footer
+            # Titel & Header
             init_str = run_date.strftime("%a, %d. %b %H:00 UTC")
             valid_str = valid_date.strftime("%a, %d. %b %H:00 UTC")
             fig.text(0.03, 0.96, f"localwx PRO  •  DWD ICON-EU  •  {title_str}", color='#ffffff', fontsize=14, fontweight='bold')
             fig.text(0.03, 0.925, f"Modell-Lauf: {init_str}   |   Gültig: {valid_str} (+{lead_h:02d}h)", color='#94a3b8', fontsize=11)
 
+            # Colorbar
             cbar_ax = fig.add_axes([0.15, 0.03, 0.70, 0.025])
             cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal')
             cbar.ax.tick_params(labelsize=9, colors='#cbd5e1')
