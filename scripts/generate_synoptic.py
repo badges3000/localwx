@@ -360,9 +360,8 @@ def generate_synoptic_dataset():
 
     params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
     domains = ['europe', 'germany']
-    # Alle 41 Zeitschritte lückenlos à 3 Stunden (0h, 3h, 6h, ..., 120h)
-    steps = list(range(0, 123, 3))
-    print(f"📦 Verarbeite alle {len(steps)} Zeitschritte (0h bis +120h) mit {len(steps)*8} Karten...")
+    steps = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 42, 48, 54, 60, 72, 84, 96, 120]
+    print(f"📦 Verarbeite {len(steps)} Zeitschritte (0h bis +120h) mit {len(steps)*8} Karten...")
 
     manifest = {
         "model": "DWD ICON-EU",
