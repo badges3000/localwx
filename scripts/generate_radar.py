@@ -6,9 +6,10 @@ Erzeugt gestochen scharfe Vektor-Stil Radar-Overlays im offiziellen
 DWD WarnWetter / Kachelmann Look:
 
 Features:
-- Diskrete DWD Isolinien-Quantisierung (6 Farb- & Intensitätsbänder)
-- Leuchtende Vektor-Außenkonturlinien (Strokes) für jede Regenstufe
-- Organische Glättung ohne Treppenartefakte
+- Analytische Sub-Pixel Vektor-Isolinien (Distance-Field Rendering)
+- Organisch abgerundete Kurven (Bicubic Splines) OHNE Pixel-Treppen
+- Knackig scharfe Kanten (exakt 1-Pixel Antialiasing, KEIN Weichzeichner-Dunst)
+- Leuchtende, gleichmäßige Vektor-Außenkonturlinien (Strokes)
 - Exakte DWD DE1200 Koordinaten-Offsets (x_0 = -543.462 km, y_0 = -4808.645 km)
 - DWD KONRAD3D Gewitter-Zellen Erkennung & Boden-Snapping
 - Kompakte, 100% verlustfreie WebP-Kompression
@@ -39,19 +40,20 @@ RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 # VEKTOR-FARBSTUFEN & KONTURLINIEN (DWD WARNWETTER STANDARD)
 # ==============================================================================
 
+# 6 meteorologische Vektor-Bänder: (Schwellenwert_Roh, Fill_RGBA, Stroke_RGBA, Stroke_Breite_px)
 VECTOR_LEVELS = [
-    # 1. Zarter Niesel / Feuchtesaum (0.24 - 0.60 mm/h)
-    (1, 25, (22, 185, 235, 175), (56, 220, 250, 255)),
-    # 2. Leichter bis mäßiger Landregen (0.72 - 2.40 mm/h)
-    (26, 90, (34, 197, 94, 230), (74, 222, 128, 255)),
-    # 3. Kräftiger Schauer (2.52 - 6.60 mm/h)
-    (91, 150, (234, 179, 8, 245), (253, 224, 71, 255)),
-    # 4. Starkregen (6.72 - 16.8 mm/h)
-    (151, 200, (234, 88, 12, 255), (251, 146, 60, 255)),
-    # 5. Unwetter / Extremregen (16.9 - 33.6 mm/h)
-    (201, 235, (220, 38, 38, 255), (248, 113, 113, 255)),
-    # 6. Hagelkern / Extremer Starkregen (> 33.6 mm/h)
-    (236, 255, (192, 38, 211, 255), (255, 255, 255, 255))
+    # 1. Zarter Niesel / Feuchtesaum (val >= 2.0 -> 0.24 mm/h)
+    (2.0, (22, 185, 235, 175), (56, 220, 250, 255), 1.8),
+    # 2. Leichter bis mäßiger Landregen (val >= 6.0 -> 0.72 mm/h)
+    (6.0, (34, 197, 94, 230), (74, 222, 128, 255), 1.8),
+    # 3. Kräftiger Schauer (val >= 21.0 -> 2.52 mm/h)
+    (21.0, (234, 179, 8, 245), (253, 224, 71, 255), 2.0),
+    # 4. Starkregen (val >= 56.0 -> 6.72 mm/h)
+    (56.0, (234, 88, 12, 255), (251, 146, 60, 255), 2.0),
+    # 5. Unwetter / Extremregen (val >= 141.0 -> 16.9 mm/h)
+    (141.0, (220, 38, 38, 255), (248, 113, 113, 255), 2.2),
+    # 6. Hagelkern / Extremer Starkregen (val >= 281.0 -> > 33.7 mm/h)
+    (281.0, (192, 38, 211, 255), (255, 255, 255, 255), 2.4)
 ]
 
 
@@ -98,18 +100,24 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 
 def reproject_and_smooth_radar(grid_1200x1100):
+    """
+    Bicubic-Spline Reprojektion (order=3) + organische Glättung für perfekt
+    abgerundete Vektorkurven ohne Treppeneffekte.
+    """
     try:
         from scipy.ndimage import map_coordinates, gaussian_filter
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
-        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
-        smoothed = gaussian_filter(warped, sigma=0.85)
-        smoothed[warped == 0] = 0
-        return np.clip(smoothed, 0, 255).astype(np.uint8)
+        # Bicubic Spline (order=3) interpoliert stufenlos zwischen den 1-km Rasterzellen
+        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=3, mode='constant', cval=0.0)
+        # Organische Rundung (sigma=1.6) für geschmeidige Vektor-Isolinien
+        smoothed = gaussian_filter(warped, sigma=1.6)
+        smoothed[warped == 0] = 0.0
+        return np.maximum(0.0, smoothed)
     except ImportError:
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
-        return np.array(img.resize((1400, 1400), Image.BILINEAR))
+        return np.array(img.resize((1400, 1400), Image.BICUBIC), dtype=np.float32)
 
 
 def remove_isolated_radar_clutter(val):
@@ -146,30 +154,6 @@ def remove_isolated_radar_clutter(val):
         return val
 
 
-def map_radolan_val_to_index(val):
-    idx = np.zeros_like(val, dtype=np.uint8)
-
-    m1 = (val >= 2) & (val < 6)
-    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
-
-    m2 = (val >= 6) & (val < 21)
-    idx[m2] = (26 + ((val[m2] - 6) / 15.0) * 64).astype(np.uint8)
-
-    m3 = (val >= 21) & (val < 56)
-    idx[m3] = (91 + ((val[m3] - 21) / 35.0) * 59).astype(np.uint8)
-
-    m4 = (val >= 56) & (val < 141)
-    idx[m4] = (151 + ((val[m4] - 56) / 85.0) * 49).astype(np.uint8)
-
-    m5 = (val >= 141) & (val < 281)
-    idx[m5] = (201 + ((val[m5] - 141) / 140.0) * 34).astype(np.uint8)
-
-    m6 = val >= 281
-    idx[m6] = np.clip(236 + (val[m6] - 281) / 5.0, 236, 255).astype(np.uint8)
-
-    return idx
-
-
 def parse_radolan_binary(data_bytes):
     etx_pos = data_bytes.find(b'\x03')
     if etx_pos == -1:
@@ -188,57 +172,87 @@ def parse_radolan_binary(data_bytes):
     if len(raw_data) >= expected_16bit:
         arr = np.frombuffer(raw_data[:expected_16bit], dtype=np.uint16).reshape((height, width))
         is_nodata = (arr & 0x6000) > 0
-        val = arr & 0x0FFF
-        val[is_nodata] = 0
-        val[val < 2] = 0
+        val = (arr & 0x0FFF).astype(np.float32)
+        val[is_nodata] = 0.0
+        val[val < 2.0] = 0.0
 
         val = remove_isolated_radar_clutter(val)
-        grid_indexed = map_radolan_val_to_index(val)
-        return header, grid_indexed
+        return header, val
 
     return None, None
 
 
 # ==============================================================================
-# VEKTOR-STIL RENDERING ENGINE (DWD WARNWETTER LOOK)
+# ANALYTISCHE VEKTOR-STIL RENDERING ENGINE (DWD WARNWETTER LOOK)
 # ==============================================================================
 
-def render_vector_matrix_to_webp(warped_grid, output_path):
-    h, w = warped_grid.shape
-    rgba_buffer = np.zeros((h, w, 4), dtype=np.uint8)
-
-    if not np.any(warped_grid > 0):
-        img = Image.fromarray(rgba_buffer, mode='RGBA')
-        img.save(output_path, 'WEBP', lossless=True, quality=100, method=6)
+def render_vector_matrix_to_webp(field, output_path):
+    """
+    Analytic Vector-Style Rendering Engine:
+    Rendert glatte, organisch abgerundete Vektor-Isolinien mit
+    gestochen scharfer Sub-Pixel Kantenschärfe (kein Weichzeichner!).
+    """
+    h, w = field.shape
+    if not np.any(field >= 1.5):
+        empty_img = Image.fromarray(np.zeros((h, w, 4), dtype=np.uint8), mode='RGBA')
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        empty_img.save(output_path, 'WEBP', lossless=True, quality=100, method=6)
         return
 
-    try:
-        from scipy.ndimage import binary_dilation, binary_erosion
+    # 1. Berechne den Sub-Pixel Gradientenbetrag |grad(field)| für analytische Distanz
+    gy, gx = np.gradient(field)
+    grad_mag = np.sqrt(gx * gx + gy * gy) + 1e-4
 
-        # Rendere die Vektor-Stufen von unten nach oben (Niesel -> Starkregen)
-        for min_idx, max_idx, fill_rgba, stroke_rgba in VECTOR_LEVELS:
-            mask = warped_grid >= min_idx
-            if not np.any(mask):
-                continue
+    # 2. RGBA Canvas in Float (0.0 .. 1.0)
+    out_r = np.zeros((h, w), dtype=np.float32)
+    out_g = np.zeros((h, w), dtype=np.float32)
+    out_b = np.zeros((h, w), dtype=np.float32)
+    out_a = np.zeros((h, w), dtype=np.float32)
 
-            # 1. Fläche füllen
-            rgba_buffer[mask] = fill_rgba
+    # 3. Rendere von niedrigster Stufe (Niesel) bis höchster Stufe (Hagel)
+    for threshold, fill_rgba, stroke_rgba, stroke_w in VECTOR_LEVELS:
+        if not np.any(field >= (threshold - 1.0)):
+            continue
 
-            # 2. Außenkontur (1.5 Pixel Stroke) ermitteln
-            dilated = binary_dilation(mask, iterations=1)
-            eroded = binary_erosion(mask, iterations=1)
-            edge_mask = dilated & ~eroded
+        # Vorzeichenbehaftete Subpixel-Distanz zur Isolinie (in Pixeln)
+        # d > 0 = innerhalb des Polygons, d = 0 = Konturlinie, d < 0 = außerhalb
+        d = (field - threshold) / grad_mag
 
-            # 3. Leuchtenden Stroke überlagern
-            rgba_buffer[edge_mask] = stroke_rgba
+        # A) Analytische Vektor-Flächenfüllung: Exakt 1-Pixel Sub-Pixel Schärfe an der Kante
+        fill_cov = np.clip(d + 0.5, 0.0, 1.0)
+        
+        # B) Analytische leuchtende Vektor-Außenlinie mit definierter Breite stroke_w
+        stroke_cov = np.clip(1.0 - np.abs(d) / (stroke_w / 2.0), 0.0, 1.0)
 
-    except ImportError:
-        for min_idx, max_idx, fill_rgba, stroke_rgba in VECTOR_LEVELS:
-            mask = warped_grid >= min_idx
-            if np.any(mask):
-                rgba_buffer[mask] = fill_rgba
+        # Normalisierte Farben
+        f_r, f_g, f_b, f_a = [c / 255.0 for c in fill_rgba]
+        s_r, s_g, s_b, s_a = [c / 255.0 for c in stroke_rgba]
 
-    img = Image.fromarray(rgba_buffer, mode='RGBA')
+        # Kombiniere Stroke und Fill
+        s_weight = stroke_cov * s_a
+        f_weight = np.maximum(0.0, fill_cov * f_a - s_weight * 0.7)
+        total_w = s_weight + f_weight + 1e-6
+
+        curr_r = (s_weight * s_r + f_weight * f_r) / total_w
+        curr_g = (s_weight * s_g + f_weight * f_g) / total_w
+        curr_b = (s_weight * s_b + f_weight * f_b) / total_w
+        curr_a = np.maximum(fill_cov * f_a, stroke_cov * s_a)
+
+        # Standard Alpha-Blend über den bestehenden Canvas
+        inv_a = 1.0 - curr_a
+        out_r = curr_r * curr_a + out_r * inv_a
+        out_g = curr_g * curr_a + out_g * inv_a
+        out_b = curr_b * curr_a + out_b * inv_a
+        out_a = curr_a + out_a * inv_a
+
+    # 4. In 8-Bit RGBA Bild konvertieren und verlustfrei speichern
+    img_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    img_rgba[..., 0] = np.clip(out_r * 255.0, 0, 255).astype(np.uint8)
+    img_rgba[..., 1] = np.clip(out_g * 255.0, 0, 255).astype(np.uint8)
+    img_rgba[..., 2] = np.clip(out_b * 255.0, 0, 255).astype(np.uint8)
+    img_rgba[..., 3] = np.clip(out_a * 255.0, 0, 255).astype(np.uint8)
+
+    img = Image.fromarray(img_rgba, mode='RGBA')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img.save(output_path, 'WEBP', lossless=True, quality=100, method=6)
 
@@ -300,7 +314,7 @@ def apply_temporal_consistency_filter(grid_list):
     if n_frames < 3:
         return grid_list
 
-    stack = np.array(grid_list, dtype=np.uint8)
+    stack = np.array(grid_list, dtype=np.float32)
     cleaned = np.copy(stack)
 
     for i in range(1, n_frames - 1):
@@ -311,8 +325,8 @@ def apply_temporal_consistency_filter(grid_list):
         single_frame_pop = (curr_f > 0) & (prev_f == 0) & (next_f == 0)
         cleaned[i][single_frame_pop] = 0
 
-        gap_drop = (curr_f == 0) & (prev_f >= 26) & (next_f >= 26)
-        cleaned[i][gap_drop] = ((prev_f[gap_drop].astype(np.uint16) + next_f[gap_drop].astype(np.uint16)) // 2).astype(np.uint8)
+        gap_drop = (curr_f == 0) & (prev_f >= 6.0) & (next_f >= 6.0)
+        cleaned[i][gap_drop] = (prev_f[gap_drop] + next_f[gap_drop]) / 2.0
 
     return [cleaned[i] for i in range(n_frames)]
 
@@ -351,7 +365,7 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
         max_val = np.max(window) if window.size > 0 else 0
 
         if max_val >= 15:
-            threshold = max(15, int(0.82 * max_val))
+            threshold = max(15.0, 0.82 * max_val)
             mask = window >= threshold
             y_indices, x_indices = np.where(mask)
             weights = np.power(window[mask].astype(np.float64) - threshold + 1.0, 2.0)
@@ -634,7 +648,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
 
 def generate_vector_radar_dataset():
     start_time = time.time()
-    print("🚀 Starte DWD RADOLAN HD Vektor-Stil Radar Pipeline (DWD WarnWetter Look)...")
+    print("🚀 Starte DWD RADOLAN HD Vektor-Stil Radar Pipeline (Analytic Subpixel Engine)...")
 
     output_dir = "./dist/radar"
     os.makedirs(output_dir, exist_ok=True)
@@ -717,7 +731,7 @@ def generate_vector_radar_dataset():
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    print(f"🎨 Rendere {len(all_items)} Frames im DWD Vektor-Stil (Isolinien + Strokes)...")
+    print(f"🎨 Rendere {len(all_items)} Frames im analytischen Vektor-Stil (Glatte Isolinien + Strokes)...")
 
     frames_metadata = []
 
@@ -725,11 +739,13 @@ def generate_vector_radar_dataset():
         item = all_items[idx]
         grid = cleaned_grids[idx]
         
-        warped_grid = reproject_and_smooth_radar(grid)
+        # Bicubic-Reprojektion + organische Isolinien-Rundung
+        field = reproject_and_smooth_radar(grid)
         file_name = f"radar_{idx:03d}.webp"
         file_path = os.path.join(output_dir, file_name)
         
-        render_vector_matrix_to_webp(warped_grid, file_path)
+        # Analytisches Vektor-Rendering mit 1-Pixel Subpixel-Schärfe
+        render_vector_matrix_to_webp(field, file_path)
 
         return {
             "step": idx,
