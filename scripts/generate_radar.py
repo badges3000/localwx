@@ -40,20 +40,20 @@ RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
 # VEKTOR-FARBSTUFEN & KONTURLINIEN (DWD WARNWETTER STANDARD)
 # ==============================================================================
 
-# 6 meteorologische Vektor-Bänder: (Schwellenwert_Roh, Fill_RGBA, Stroke_RGBA, Stroke_Breite_px)
+# 6 meteorologische Vektor-Bänder: (Schwellenwert_Roh, Fill_RGBA, Stroke_RGBA, Stroke_Breite_px_bei_2400)
 VECTOR_LEVELS = [
     # 1. Zarter Niesel / Feuchtesaum (val >= 2.0 -> 0.24 mm/h)
-    (2.0, (22, 185, 235, 175), (56, 220, 250, 255), 1.8),
+    (2.0, (22, 185, 235, 175), (56, 220, 250, 255), 3.2),
     # 2. Leichter bis mäßiger Landregen (val >= 6.0 -> 0.72 mm/h)
-    (6.0, (34, 197, 94, 230), (74, 222, 128, 255), 1.8),
+    (6.0, (34, 197, 94, 230), (74, 222, 128, 255), 3.2),
     # 3. Kräftiger Schauer (val >= 21.0 -> 2.52 mm/h)
-    (21.0, (234, 179, 8, 245), (253, 224, 71, 255), 2.0),
+    (21.0, (234, 179, 8, 245), (253, 224, 71, 255), 3.6),
     # 4. Starkregen (val >= 56.0 -> 6.72 mm/h)
-    (56.0, (234, 88, 12, 255), (251, 146, 60, 255), 2.0),
+    (56.0, (234, 88, 12, 255), (251, 146, 60, 255), 3.6),
     # 5. Unwetter / Extremregen (val >= 141.0 -> 16.9 mm/h)
-    (141.0, (220, 38, 38, 255), (248, 113, 113, 255), 2.2),
+    (141.0, (220, 38, 38, 255), (248, 113, 113, 255), 4.0),
     # 6. Hagelkern / Extremer Starkregen (val >= 281.0 -> > 33.7 mm/h)
-    (281.0, (192, 38, 211, 255), (255, 255, 255, 255), 2.4)
+    (281.0, (192, 38, 211, 255), (255, 255, 255, 255), 4.4)
 ]
 
 
@@ -63,7 +63,7 @@ VECTOR_LEVELS = [
 
 _WARP_COORDS = None
 
-def get_reprojection_coords(target_h=1400, target_w=1400):
+def get_reprojection_coords(target_h=2400, target_w=2400):
     global _WARP_COORDS
     if _WARP_COORDS is not None:
         return _WARP_COORDS
@@ -101,23 +101,22 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 def reproject_and_smooth_radar(grid_1200x1100):
     """
-    Bicubic-Spline Reprojektion (order=3) + organische Glättung für perfekt
-    abgerundete Vektorkurven ohne Treppeneffekte.
+    High-DPI Bicubic-Spline Reprojektion (2400x2400) + stufenlose organische Rundung
+    für absolut glatte, elegante Vektorkurven (wie in Illustrator / DWD WarnWetter).
     """
     try:
         from scipy.ndimage import map_coordinates, gaussian_filter
 
-        y_coords, x_coords = get_reprojection_coords(1400, 1400)
-        # Bicubic Spline (order=3) interpoliert stufenlos zwischen den 1-km Rasterzellen
+        y_coords, x_coords = get_reprojection_coords(2400, 2400)
+        # Bicubic Spline (order=3) erzeugt stufenlose, geschwungene Kurven
         warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=3, mode='constant', cval=0.0)
-        # Organische Rundung (sigma=1.6) für geschmeidige Vektor-Isolinien
-        smoothed = gaussian_filter(warped, sigma=1.6)
-        smoothed[warped == 0] = 0.0
+        # Organische Rundung (sigma=2.6 bei 2400x2400) für geschmeidige Vektor-Isolinien
+        smoothed = gaussian_filter(warped, sigma=2.6)
         return np.maximum(0.0, smoothed)
     except ImportError:
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
-        return np.array(img.resize((1400, 1400), Image.BICUBIC), dtype=np.float32)
+        return np.array(img.resize((2400, 2400), Image.BICUBIC), dtype=np.float32)
 
 
 def remove_isolated_radar_clutter(val):
