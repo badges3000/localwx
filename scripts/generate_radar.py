@@ -136,9 +136,9 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
 
     # Offset der linken unteren Ecke (SW) im 1100x1200 RADOLAN Raster
-    # DWD DE1200 Gitter: x_0 = -543.197 km, y_0 (South) = -4822.589 km
-    x_px = x_proj + 543.197
-    y_px = y_proj + 4822.589
+    # Exaktes DWD DE1200 Gitter: x_0 = -543.462 km, y_0 (South) = -4808.645 km
+    x_px = x_proj + 543.462
+    y_px = y_proj + 4808.645
 
     _WARP_COORDS = (y_px, x_px)
     return _WARP_COORDS
@@ -446,8 +446,8 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
         xp = m * np.cos(phi) * np.sin(lam - lon_0)
         yp = -m * np.cos(phi) * np.cos(lam - lon_0)
 
-        cx = int(round(xp + 543.197))
-        cy = int(round(yp + 4822.589))
+        cx = int(round(xp + 543.462))
+        cy = int(round(yp + 4808.645))
 
         h, w = surface_grid.shape
         r_px = int(round(search_radius_km))
@@ -472,8 +472,8 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
                 y_ground = np.sum(y_indices * weights) / np.sum(weights) + ymin
 
                 # Rückprojektion auf WGS84
-                xp_g = x_ground - 543.197
-                yp_g = y_ground - 4822.589
+                xp_g = x_ground - 543.462
+                yp_g = y_ground - 4808.645
                 d = np.sqrt(xp_g * xp_g + yp_g * yp_g)
                 phi_g = np.pi / 2.0 - 2.0 * np.arctan(d / scale)
                 lam_g = lon_0 + np.arctan2(xp_g, -yp_g)
