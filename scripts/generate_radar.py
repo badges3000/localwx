@@ -5,10 +5,10 @@ DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
 Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
-- Exakte DWD DE1200 Polar-Stereo-Entzerrung (Warp auf Leaflet / WGS84)
-- Feinfühlige Schauerdynamik für junge Zellen und Nieselbänder
+- Exakte Polar-Stereographische Entzerrung (Warp auf EPSG:4326/Leaflet)
+- Organische Isolinien-Glättung im DWD WarnWetter / Kachelmann Vektor-Stil
+- Nieselbrücken-Schutz via morphologischer Dilatation für lückenlose Regenfronten
 - Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
-- DWD KONRAD3D 3D-Zelltracking mit Boden-Snapping
 - 100% verlustfreies WebP (lossless=True, method=6)
 - Erzeugt meta.json und lädt per FTPS nach /data/radar/ hoch.
 """
@@ -52,14 +52,15 @@ def build_turbo_lut():
             r = int(30 + t * 20)
             g = int(185 + t * 45)
             b = int(245 - t * 15)
-            a = 255  # 100% Opazität für gestochen scharfe Außenkanten
+            a = int(170 + t * 65)  # Scharfe, saubere Kante ohne trüben Dunst
         elif i < 91:
             # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
+            # Bildet wie in der WarnWetter App die voll deckende Hauptmasse des Regens
             t = (i - 26) / 64.0
             r = int(45 + t * 125)
             g = int(218 + t * 25)
             b = int(70 - t * 55)
-            a = 255
+            a = 255  # 100% Opazität für maximalen Kontrast über Land & Meer
         elif i < 151:
             # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.52 - 6.60 mm/h)
             t = (i - 91) / 59.0
@@ -101,8 +102,8 @@ _WARP_COORDS = None
 
 def get_reprojection_coords(target_h=1400, target_w=1400):
     """
-    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> WGS84/Leaflet).
-    Wird einmalig vorberechnet und für alle Frames wiederverwendet.
+    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> Web Mercator EPSG:3857).
+    Wird einmalig vorberechnet und für alle 120 Frames wiederverwendet.
     """
     global _WARP_COORDS
     if _WARP_COORDS is not None:
@@ -117,8 +118,13 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     lon_0 = np.radians(10.0)   # Zentralmeridian 10°E
     scale = R * (1.0 + np.sin(lat_ts))
 
-    # Lineare WGS84 Lat/Lon Abtastung (Nord oben nach Süd unten)
-    lats = np.linspace(lat_max, lat_min, target_h)
+    # Exakte Web-Mercator (EPSG:3857) Breiten-Abtastung (Nord oben nach Süd unten):
+    y_merc_max = np.log(np.tan(np.pi / 4.0 + np.radians(lat_max) / 2.0))
+    y_merc_min = np.log(np.tan(np.pi / 4.0 + np.radians(lat_min) / 2.0))
+    y_merc_grid = np.linspace(y_merc_max, y_merc_min, target_h)
+    lats = np.degrees(2.0 * np.arctan(np.exp(y_merc_grid)) - np.pi / 2.0)
+
+    # Längengrade sind in Web Mercator und WGS84 linear:
     lons = np.linspace(lon_min, lon_max, target_w)
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
@@ -129,7 +135,8 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     x_proj = m * np.cos(phi) * np.sin(lam - lon_0)
     y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
 
-    # Exakte DWD DE1200 Gitter-Nullpunkte (SW-Ecke im 1100x1200 Raster)
+    # Offset der linken unteren Ecke (SW) im 1100x1200 RADOLAN Raster
+    # DWD DE1200 Gitter: x_0 = -543.197 km, y_0 (South) = -4822.589 km
     x_px = x_proj + 543.197
     y_px = y_proj + 4822.589
 
@@ -139,25 +146,26 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 def reproject_and_smooth_radar(grid_1200x1100):
     """
-    Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326)
-    mit sauberer bilinearer Abtastung.
+    1. Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326).
+    2. Wendet organische Konturglättung (Isolinien-Filter) an.
     """
     try:
-        from scipy.ndimage import map_coordinates
+        from scipy.ndimage import map_coordinates, gaussian_filter
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
         
-        warped = map_coordinates(
-            grid_1200x1100.astype(np.float32),
-            [y_coords, x_coords],
-            order=1,
-            mode='constant',
-            cval=0.0
-        )
+        # Reprojektion mit bilinearer Interpolation
+        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
         
-        return np.clip(warped, 0, 255).astype(np.uint8)
+        # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
+        smoothed = gaussian_filter(warped, sigma=0.75)
+        
+        # Scharfe Grenze für Niesel erhalten
+        smoothed[warped == 0] = 0
+        return np.clip(smoothed, 0, 255).astype(np.uint8)
 
     except ImportError:
+        # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
         return np.array(img.resize((1400, 1400), Image.BILINEAR))
@@ -165,9 +173,12 @@ def reproject_and_smooth_radar(grid_1200x1100):
 
 def remove_isolated_radar_clutter(val):
     """
-    Präziser Clutter-Filter:
-    Entfernt nur winzige isolierte Sensor-Sprenkel (< 25 Pixel ohne Kern),
-    schützt aber alle echten Schauerzellen, Küstenbänder und Nieselfronten.
+    Meteorologischer Nieselbrücken- & Flächenfilter:
+
+    1. Echte Kerne (val >= 4 bzw. > 0.48 mm/h) und große Fronten (>= 150 Pixel) definieren Regenfronten.
+    2. Nieselbrücken-Schutz: Durch morphologische Dilatation werden kleinere Nieselinseln im Umkreis
+       von 15 km um echte Fronten geschützt und nicht gelöscht.
+    3. Nur isolierter Turm-Clutter (< 150 Pixel, ohne Kern und ohne räumlichen Frontenbezug) wird entfernt.
     """
     if not np.any(val > 0):
         return val
@@ -183,22 +194,26 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        # 1. Echter Niederschlag: Peak >= 3 ODER zusammenhängende Fläche >= 25 Pixel
-        is_valid = (cluster_maxs >= 3) | (cluster_sizes >= 25)
-        valid_ids = indices[is_valid]
+        # 1. Sichere Regenfronten: Haben einen Schauerkern (val >= 4) ODER sind groß (>= 150 Pixel)
+        is_core_or_large = (cluster_maxs >= 4) | (cluster_sizes >= 150)
+        valid_ids = indices[is_core_or_large]
 
-        # 2. Nieselbrücken-Schutz: 10 km Umkreis um alle echten Fronten
+        # 2. Maske der sicheren Fronten erstellen
         valid_mask = np.isin(labeled_array, valid_ids)
-        expanded_zone = binary_dilation(valid_mask, iterations=10)
 
+        # 3. Nieselbrücken-Schutz: Dehne die Zone um 15 Pixel (~15 km) aus
+        expanded_zone = binary_dilation(valid_mask, iterations=15)
+
+        # 4. Prüfe Überlappung jedes Clusters mit der erweiterten Zone
         overlap = nd_sum(expanded_zone.astype(int), labels=labeled_array, index=indices)
-        keep_cluster = is_valid | (overlap > 0)
+        is_valid_cluster = is_core_or_large | (overlap > 0)
 
-        invalid_ids = indices[~keep_cluster]
+        invalid_cluster_ids = indices[~is_valid_cluster]
 
         clean_val = val.copy()
-        if len(invalid_ids) > 0:
-            clean_val[np.isin(labeled_array, invalid_ids)] = 0
+        if len(invalid_cluster_ids) > 0:
+            is_invalid_pixel = np.isin(labeled_array, invalid_cluster_ids)
+            clean_val[is_invalid_pixel] = 0
 
         return clean_val
     except ImportError:
@@ -271,7 +286,7 @@ def parse_radolan_binary(data_bytes):
         # Thermischen Antennen-Rauschboden (< 0.24 mm/h) auf 0 setzen
         val[val < 2] = 0
 
-        # Meteorologischer Filter
+        # Meteorologischer Nieselbrücken- & Flächenfilter
         val = remove_isolated_radar_clutter(val)
 
         # Meteorologisch exakt auf 0..255 LUT mappen
@@ -347,6 +362,9 @@ def render_matrix_to_webp(grid_reprojected_1400, output_path):
     """
     rgba = TURBO_LUT[grid_reprojected_1400]
     
+    # Dünne Rest-Transparenzen unter 10 säubern
+    rgba[rgba[:, :, 3] < 10, 3] = 0
+    
     img_clean = Image.fromarray(rgba, mode='RGBA')
     img_clean.save(output_path, 'WEBP', lossless=True, method=6)
 
@@ -386,6 +404,7 @@ def apply_temporal_consistency_filter(grid_list):
             next_active = maximum_filter(next_g > 0, size=7)
             temporal_support = prev_active | next_active
 
+            # Indizes 1..25 entsprechen Niesel/Feuchtesaum (< 0.6 mm/h)
             is_spike = (curr_clean > 0) & (curr_clean <= 25) & (~temporal_support)
             curr_clean[is_spike] = 0
 
@@ -410,6 +429,7 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
     Intelligentes Boden-Snapping:
     Sucht im Umkreis von bis zu 35 km um den 3D-Höhenschwerpunkt der Gewitterzelle
     nach dem tatsächlichen Starkregen-/Reflektivitätskern am Boden im RADOLAN-Raster.
+    Gibt (lat_ground, lon_ground, d_lat, d_lon) zurück.
     """
     if surface_grid is None:
         return lat_aloft, lon_aloft, 0.0, 0.0
@@ -439,7 +459,9 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
         window = surface_grid[ymin:ymax+1, xmin:xmax+1]
         max_val = np.max(window) if window.size > 0 else 0
 
+        # Nur snappen, wenn im Umkreis tatsächlich ein relevanter Niederschlagskern (>= 15) existiert
         if max_val >= 15:
+            # Fokus auf den echten Peak-Kern (>= 82% des Maximums) mit quadratischer Gewichtung
             threshold = max(15, int(0.82 * max_val))
             mask = window >= threshold
             y_indices, x_indices = np.where(mask)
@@ -449,6 +471,7 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
                 x_ground = np.sum(x_indices * weights) / np.sum(weights) + xmin
                 y_ground = np.sum(y_indices * weights) / np.sum(weights) + ymin
 
+                # Rückprojektion auf WGS84
                 xp_g = x_ground - 543.197
                 yp_g = y_ground - 4822.589
                 d = np.sqrt(xp_g * xp_g + yp_g * yp_g)
@@ -472,8 +495,10 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
 
 def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
     """
-    Lädt das neueste DWD KONRAD3D XML von opendata.dwd.de herunter
-    und erzeugt ein optimiertes cells.json.
+    Lädt das neueste DWD KONRAD3D (3D-Zelltracking) XML von opendata.dwd.de herunter
+    und erzeugt ein optimiertes cells.json mit allen aktiven Gewitterzellen,
+    Zugbahnen, Hagel-Flags, dBZ-Werten und Geschwindigkeiten.
+    Wendet intelligentes Boden-Snapping auf das sichtbare RADOLAN-Bodenradar an.
     """
     print("⚡ Rufe aktuelle DWD KONRAD3D Gewitter- & Hagelzell-Daten ab...")
     cells_data = {
@@ -514,6 +539,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
         for feat in root.findall('.//feature'):
             feat_id = feat.attrib.get('identifier', str(len(parsed_cells) + 1))
             
+            # 1. Centroid (Schwerpunkt)
             centroid = feat.find('.//centroid_3d/geodetic_coordinate')
             if centroid is None:
                 continue
@@ -527,6 +553,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
             height_elem = centroid.find('height_msl')
             height_m = round(float(height_elem.text), 0) if height_elem is not None else 0
             
+            # 2. Motion & Velocity
             motion = feat.find('.//motion')
             speed = 0.0
             direction = 0.0
@@ -552,6 +579,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                     except ValueError:
                         pass
 
+            # 3. Intensity, Reflectivity & Hazards
             intensity = feat.find('.//intensity')
             max_dbz = 0.0
             severity = 0
@@ -595,6 +623,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                     except ValueError:
                         pass
 
+            # 4. Lightning & Mesocyclone
             lightning_rate = 0
             lt_elem = feat.find('.//lightning/lightning_rate')
             if lt_elem is not None and lt_elem.text:
@@ -611,6 +640,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                 except ValueError:
                     pass
 
+            # 5. Geodetic Polygon
             polygon_coords = []
             poly = feat.find('.//polygons_projected/geodetic_coordinates/polygon')
             if poly is not None:
@@ -624,6 +654,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                     except Exception:
                         pass
 
+            # 6. Future Track Forecast (+5m bis +60m direkt aus DWD centroid_forecast)
             forecast_track = []
             for fc_elem in feat.findall('.//forecast/centroid_forecasts/centroid_forecast'):
                 fc_lat = fc_elem.find('.//geodetic_coordinate/latitude')
@@ -655,6 +686,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                     except ValueError:
                         pass
 
+            # Berechne echte Zugrichtung & Geschwindigkeit aus dem ersten Vektorpunkt falls nicht explizit gegeben
             if forecast_track:
                 first_pt = forecast_track[0]
                 d_lat = first_pt["lat"] - lat
@@ -666,6 +698,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                     dist_km = np.sqrt((d_lat * 111.32)**2 + (d_lon * 111.32)**2)
                     speed = round(dist_km / (first_pt["lead_time_min"] / 60.0), 1)
 
+            # 7. Boden-Snapping: Zentriere Marker, Polygon & Zugbahn auf den tatsächlichen Boden-Radarkern
             lat_ground, lon_ground, d_lat, d_lon = snap_cell_to_surface_radar(lat, lon, surface_grid)
             if abs(d_lat) > 0.0001 or abs(d_lon) > 0.0001:
                 dist_corr = np.sqrt(((d_lat * 111.32) ** 2) + ((d_lon * 111.32 * np.cos(np.radians(lat))) ** 2))
@@ -677,6 +710,7 @@ def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
                 if forecast_track:
                     forecast_track = [{**pt, "lat": round(pt["lat"] + d_lat, 5), "lon": round(pt["lon"] + d_lon, 5)} for pt in forecast_track]
 
+            # Farb- & Gefahrenklassifikation
             level = "moderate"
             level_name = "Mäßiges Gewitter"
             color = "#f59e0b"
@@ -817,11 +851,11 @@ def generate_radar_dataset():
     all_items.sort(key=lambda x: x['valid_dt'])
     print(f"🧠 Wende 3-Stufen Temporal & Spatial Anti-Pop Filter auf alle {len(all_items)} Frames an...")
 
-    # 1. Temporal Consistency Filter
+    # 1. Temporal Consistency Filter auf raw radar grids
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    print(f"🌐 Führe exakte Polar-Stereo-Reprojektion (WGS84) durch...")
+    print(f"🌐 Führe Polar-Stereographische Reprojektion & Isolinien-Glättung durch...")
 
     # 2. Paralleles Reprojizieren und Rendern
     frames_metadata = []
@@ -830,6 +864,7 @@ def generate_radar_dataset():
         item = all_items[idx]
         grid = cleaned_grids[idx]
         
+        # Exakte Reprojektion von Polar-Stereo auf WGS84 + Konturglättung
         warped_grid = reproject_and_smooth_radar(grid)
         
         file_name = f"radar_{idx:03d}.webp"
@@ -853,7 +888,7 @@ def generate_radar_dataset():
     frames_metadata.sort(key=lambda x: x['step'])
     print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
 
-    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen
+    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen (mit Boden-Snapping auf das neueste Boden-Radar)
     latest_surface_grid = raw_history_items[-1]['grid'] if raw_history_items else (cleaned_grids[-1] if cleaned_grids else None)
     cells_result = fetch_and_parse_konrad3d(output_dir, surface_grid=latest_surface_grid)
 
