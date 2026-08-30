@@ -5,7 +5,7 @@ DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
 Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
-- Exakte DWD DE1200 Polar-Stereo-Entzerrung (Warp auf EPSG:3857/Web Mercator)
+- Exakte DWD DE1200 Polar-Stereo-Entzerrung (Warp auf Leaflet / WGS84)
 - Feinfühlige Schauerdynamik für junge Zellen und Nieselbänder
 - Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
 - DWD KONRAD3D 3D-Zelltracking mit Boden-Snapping
@@ -96,12 +96,12 @@ def build_turbo_lut():
 TURBO_LUT = build_turbo_lut()
 
 
-# Vorberechnete Reprojektions-Koordinaten für das 1400x1400 WGS84/WebMercator Zielraster
+# Vorberechnete Reprojektions-Koordinaten für das 1400x1400 WGS84 Zielraster
 _WARP_COORDS = None
 
 def get_reprojection_coords(target_h=1400, target_w=1400):
     """
-    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> Web Mercator).
+    Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> WGS84/Leaflet).
     Wird einmalig vorberechnet und für alle Frames wiederverwendet.
     """
     global _WARP_COORDS
@@ -117,12 +117,8 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     lon_0 = np.radians(10.0)   # Zentralmeridian 10°E
     scale = R * (1.0 + np.sin(lat_ts))
 
-    # Exakte Web-Mercator (EPSG:3857) Breiten-Abtastung (Nord oben nach Süd unten)
-    y_merc_max = np.log(np.tan(np.pi / 4.0 + np.radians(lat_max) / 2.0))
-    y_merc_min = np.log(np.tan(np.pi / 4.0 + np.radians(lat_min) / 2.0))
-    y_merc_grid = np.linspace(y_merc_max, y_merc_min, target_h)
-    lats = np.degrees(2.0 * np.arctan(np.exp(y_merc_grid)) - np.pi / 2.0)
-
+    # Lineare WGS84 Lat/Lon Abtastung (Nord oben nach Süd unten)
+    lats = np.linspace(lat_max, lat_min, target_h)
     lons = np.linspace(lon_min, lon_max, target_w)
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
@@ -133,9 +129,9 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     x_proj = m * np.cos(phi) * np.sin(lam - lon_0)
     y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
 
-    # Exakte DWD DE1200 Raster-Offsets (SW-Ecke im 1100x1200 Gitter)
-    x_px = x_proj + 523.462
-    y_px = y_proj + 4658.645
+    # Exakte DWD DE1200 Gitter-Nullpunkte (SW-Ecke im 1100x1200 Raster)
+    x_px = x_proj + 543.197
+    y_px = y_proj + 4822.589
 
     _WARP_COORDS = (y_px, x_px)
     return _WARP_COORDS
@@ -143,7 +139,7 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
 
 def reproject_and_smooth_radar(grid_1200x1100):
     """
-    Reprojiziert das polar-stereographische RADOLAN-Gitter auf Web Mercator (EPSG:3857)
+    Reprojiziert das polar-stereographische RADOLAN-Gitter auf WGS84 (EPSG:4326)
     mit sauberer bilinearer Abtastung.
     """
     try:
@@ -430,8 +426,8 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
         xp = m * np.cos(phi) * np.sin(lam - lon_0)
         yp = -m * np.cos(phi) * np.cos(lam - lon_0)
 
-        cx = int(round(xp + 523.462))
-        cy = int(round(yp + 4658.645))
+        cx = int(round(xp + 543.197))
+        cy = int(round(yp + 4822.589))
 
         h, w = surface_grid.shape
         r_px = int(round(search_radius_km))
@@ -453,8 +449,8 @@ def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius
                 x_ground = np.sum(x_indices * weights) / np.sum(weights) + xmin
                 y_ground = np.sum(y_indices * weights) / np.sum(weights) + ymin
 
-                xp_g = x_ground - 523.462
-                yp_g = y_ground - 4658.645
+                xp_g = x_ground - 543.197
+                yp_g = y_ground - 4822.589
                 d = np.sqrt(xp_g * xp_g + yp_g * yp_g)
                 phi_g = np.pi / 2.0 - 2.0 * np.arctan(d / scale)
                 lam_g = lon_0 + np.arctan2(xp_g, -yp_g)
@@ -825,7 +821,7 @@ def generate_radar_dataset():
     raw_grids = [item['grid'] for item in all_items]
     cleaned_grids = apply_temporal_consistency_filter(raw_grids)
 
-    print(f"🌐 Führe exakte Polar-Stereo-Reprojektion (EPSG:3857) durch...")
+    print(f"🌐 Führe exakte Polar-Stereo-Reprojektion (WGS84) durch...")
 
     # 2. Paralleles Reprojizieren und Rendern
     frames_metadata = []
