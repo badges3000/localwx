@@ -46,14 +46,14 @@ VECTOR_LEVELS = [
     (2.0, (22, 185, 235, 175), (56, 220, 250, 255), 3.2),
     # 2. Leichter bis mäßiger Landregen (val >= 6.0 -> 0.72 mm/h)
     (6.0, (34, 197, 94, 230), (74, 222, 128, 255), 3.2),
-    # 3. Kräftiger Schauer (val >= 21.0 -> 2.52 mm/h)
-    (21.0, (234, 179, 8, 245), (253, 224, 71, 255), 3.6),
-    # 4. Starkregen (val >= 56.0 -> 6.72 mm/h)
-    (56.0, (234, 88, 12, 255), (251, 146, 60, 255), 3.6),
-    # 5. Unwetter / Extremregen (val >= 141.0 -> 16.9 mm/h)
-    (141.0, (220, 38, 38, 255), (248, 113, 113, 255), 4.0),
-    # 6. Hagelkern / Extremer Starkregen (val >= 281.0 -> > 33.7 mm/h)
-    (281.0, (192, 38, 211, 255), (255, 255, 255, 255), 4.4)
+    # 3. Kräftiger Schauer (val >= 21.0 -> 2.52 mm/h) -> Strahlendes Goldgelb
+    (21.0, (250, 204, 21, 255), (254, 240, 138, 255), 3.6),
+    # 4. Starkregen (val >= 56.0 -> 6.72 mm/h) -> Kräftiges Warn-Orange
+    (56.0, (249, 115, 22, 255), (253, 186, 116, 255), 3.8),
+    # 5. Unwetter / Extremregen (val >= 141.0 -> 16.9 mm/h) -> Feuriges Alarmrot
+    (141.0, (239, 68, 68, 255), (254, 202, 202, 255), 4.2),
+    # 6. Hagelkern / Extremer Starkregen (val >= 281.0 -> > 33.7 mm/h) -> Leuchtendes Magenta/Weiß
+    (281.0, (217, 70, 239, 255), (255, 255, 255, 255), 4.6)
 ]
 
 
