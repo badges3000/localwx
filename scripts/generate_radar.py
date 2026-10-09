@@ -169,7 +169,7 @@ def reproject_and_smooth_radar(grid_1200x1100):
         # Organische Konturglättung wie im DWD-Radar:
         # Weiche Rundung der Frontenränder ohne künstliche Treppenstufen oder Blockkanten
         smoothed_out = np.clip(np.round(smoothed), 0, 255).astype(np.uint8)
-        smoothed_out[smoothed < 0.4] = 0
+        smoothed_out[smoothed < 0.6] = 0
         return smoothed_out
 
     except ImportError:
@@ -263,27 +263,17 @@ def remove_isolated_radar_clutter(val):
     if not np.any(val > 0):
         return val
 
+    # 1. Virga- & Hintergrundrauschen (val == 1) abschneiden:
+    val = val.copy()
+    val[val < 2] = 0
+    if not np.any(val > 0):
+        return val
+
     try:
         from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
-        val = val.copy()
-        structure_8 = np.ones((3, 3), dtype=bool)
-
-        # 1. Echten Nieselsaum von Fronten schützen & isolierte Virga filtern:
-        # val == 1 (0.12 mm/h) ist im 2-km-Umfeld einer echten Front (val >= 2) meteorologisch realer
-        # Bodenniesel (stimmt zu 93 % mit dem DWD WarnWetter-Radar überein).
-        # Weit abseits von Fronten (isolierte Virga/Dunst ohne Kern) wird val == 1 sauber ausgefiltert.
-        rain_core = val >= 2
-        if np.any(rain_core):
-            front_fringe = binary_dilation(rain_core, structure=structure_8, iterations=2)
-            val[(val < 2) & (~front_fringe)] = 0
-        else:
-            val[val < 2] = 0
-
-        if not np.any(val > 0):
-            return val
-
         # 2. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
+        structure_8 = np.ones((3, 3), dtype=bool)
         labeled_array, num_features = label(val > 0, structure=structure_8)
         if num_features == 0:
             return val
@@ -344,9 +334,9 @@ def map_radolan_val_to_index(val):
     """
     idx = np.zeros_like(val, dtype=np.uint8)
 
-    # 1. Zarter Nieselregen & Feuchtesaum (val 1..5 -> 0.12..0.60 mm/h)
-    m1 = (val >= 1) & (val < 6)
-    idx[m1] = (1 + ((val[m1] - 1) / 5.0) * 24).astype(np.uint8)
+    # 1. Zarter Nieselregen & Feuchtesaum (val 2..5 -> 0.24..0.60 mm/h)
+    m1 = (val >= 2) & (val < 6)
+    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
 
     # 2. Leichter bis mäßiger Landregen (val 6..20 -> 0.72..2.40 mm/h)
     m2 = (val >= 6) & (val < 21)
