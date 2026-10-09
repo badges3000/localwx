@@ -242,31 +242,37 @@ def remove_isolated_radar_clutter(val):
     """
     Meteorologischer Niesel-Schutz- & Turm-Zonierungs-Filter (organisch, DWD-kalibriert):
 
-    1. Ganzheitliche Cluster-Beurteilung (8er-Konnektivität):
+    1. Rohdaten-Filter:
+       val == 1 (0.12 mm/h) in den RADOLAN RV Rohdaten ist atmosphärisches Grundrauschen
+       und Virga (zu 63 % in der DWD WarnWetter App trocken). Echter Bodenniederschlag
+       beginnt ab val >= 2 (0.24 mm/h, 99 % Übereinstimmung mit DWD).
+    2. Ganzheitliche Cluster-Beurteilung (8er-Konnektivität):
        Jedes Niederschlagsfeld wird als zusammenhängendes physikalisches Objekt bewertet.
-       Es werden NIEMALS Pixel innerhalb oder am Rand eines Clusters mit geometrischen
-       Dilation-Schablonen abgeschnitten (verhindert quadratische / rautenförmige Flecken
-       und verhindert das Aufploppen/Flackern zwischen Radar-Frames).
-    2. Turm-Zonierung (Radius 22 km um alle 17 DWD-Türme):
+       Es werden NIEMALS Pixel innerhalb eines Clusters abgeschnitten.
+    3. Turm-Zonierung (Radius 22 km um alle 17 DWD-Türme):
        Schwache Echos (val <= 2) im 22-km-Nahbereich von Radartürmen werden eliminiert,
        sofern nicht eine echte, durchziehende Großfront (>= 150 Pixel) oder ein
        Schauerkern (val >= 4) vorliegt (eliminiert abendliche Inversions-Donuts).
-    3. Großflächiger Nieselregen (z.B. auf der Ostsee):
-       Zusammenhängende Nieselfelder ab 40 Pixeln (~40 km²) bleiben vollflächig in ihrer
+    4. Großflächiger Nieselregen / Landregen:
+       Zusammenhängende Nieselfelder ab 25 Pixeln (~25 km²) bleiben vollflächig in ihrer
        natürlichen, organischen Kontur erhalten.
-    4. Fronten-Anbindung:
+    5. Fronten-Anbindung:
        Kleinere Satelliten-Fragmente (>= 10 Pixel) im 12-km-Umfeld einer sicheren Front
        werden als Ganzes mitgeschützt.
-    5. Rausch-Unterdrückung:
-       Isolierte Kleinst-Sprenkel (< 40 Pixel ohne Kern und ohne Frontenbezug) werden gelöscht.
     """
+    if not np.any(val > 0):
+        return val
+
+    # 1. Virga- & Hintergrundrauschen (val == 1) abschneiden:
+    val = val.copy()
+    val[val < 2] = 0
     if not np.any(val > 0):
         return val
 
     try:
         from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
-        # 1. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
+        # 2. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
         structure_8 = np.ones((3, 3), dtype=bool)
         labeled_array, num_features = label(val > 0, structure=structure_8)
         if num_features == 0:
@@ -276,17 +282,17 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        # 2. Turm-Maske der 17 Radarstandorte (22 km Inversions-Radius)
+        # 3. Turm-Maske der 17 Radarstandorte (22 km Inversions-Radius)
         tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=22)
         tower_overlap = nd_sum(tower_mask.astype(int), labels=labeled_array, index=indices)
         is_near_tower = tower_overlap > 0
 
-        # 3. Klassifikation der Cluster als GANZHEITLICHE Objekte:
+        # 4. Klassifikation der Cluster als GANZHEITLICHE Objekte:
         # A. Echter Schauer-/Regenkern (val >= 3 bzw. >= 0.36 mm/h) ab 15 Pixeln
         has_shower_core = (cluster_maxs >= 3) & (cluster_sizes >= 15)
 
-        # B. Großflächiger stratiformer Landregen / Nieselregen (>= 40 Pixel) AUSSERHALB von Türmen
-        is_large_rain_field = (cluster_sizes >= 40) & (~is_near_tower)
+        # B. Zusammenhängender Nieselregen / Landregen (>= 25 Pixel) AUSSERHALB von Türmen
+        is_large_rain_field = (cluster_sizes >= 25) & (~is_near_tower)
 
         # C. Echte durchziehende Großfront über einem Turm (>= 150 Pixel) ODER mit Kern (val >= 4)
         is_massive_front_over_tower = ((cluster_sizes >= 150) | (cluster_maxs >= 4)) & is_near_tower
@@ -295,7 +301,7 @@ def remove_isolated_radar_clutter(val):
         is_sure_front = has_shower_core | is_large_rain_field | is_massive_front_over_tower
         sure_ids = indices[is_sure_front]
 
-        # 4. Fronten-Anbindung für kleinere Satelliten-Fragmente im 12-km-Umfeld:
+        # 5. Fronten-Anbindung für kleinere Satelliten-Fragmente im 12-km-Umfeld:
         if len(sure_ids) > 0:
             sure_mask = np.isin(labeled_array, sure_ids)
             expanded_zone = binary_dilation(sure_mask, structure=structure_8, iterations=12)
@@ -307,7 +313,7 @@ def remove_isolated_radar_clutter(val):
         # Cluster ist valide, wenn es eine Basisfront ist ODER frontengestützt (mindestens 10 Pixel, nicht im Turmbereich)
         is_valid_cluster = is_sure_front | (has_front_support & (~is_near_tower) & (cluster_sizes >= 10))
 
-        # 5. Nur ungültige Cluster als Ganzes entfernen (niemals einzelne Pixel in gültigen Clustern abschneiden!)
+        # 6. Nur ungültige Cluster als Ganzes entfernen (niemals einzelne Pixel in gültigen Clustern abschneiden!)
         invalid_cluster_ids = indices[~is_valid_cluster]
 
         clean_val = val.copy()
@@ -327,9 +333,9 @@ def map_radolan_val_to_index(val):
     """
     idx = np.zeros_like(val, dtype=np.uint8)
 
-    # 1. Zarter Nieselregen & Feuchtesaum (val 1..5 -> 0.12..0.60 mm/h)
-    m1 = (val >= 1) & (val < 6)
-    idx[m1] = (1 + ((val[m1] - 1) / 5.0) * 24).astype(np.uint8)
+    # 1. Zarter Nieselregen & Feuchtesaum (val 2..5 -> 0.24..0.60 mm/h)
+    m1 = (val >= 2) & (val < 6)
+    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
 
     # 2. Leichter bis mäßiger Landregen (val 6..20 -> 0.72..2.40 mm/h)
     m2 = (val >= 6) & (val < 21)
