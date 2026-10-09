@@ -161,12 +161,10 @@ def reproject_and_smooth_radar(grid_1200x1100):
         # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
         smoothed = gaussian_filter(warped, sigma=0.75)
         
-        # Scharfe Grenze für Niesel erhalten, ohne Rundungsverluste an schwachen Rändern:
-        mask_active = warped > 0.1
+        # Organische Konturglättung wie im DWD-Radar:
+        # Weiche Rundung der Frontenränder ohne künstliche Treppenstufen oder Blockkanten
         smoothed_out = np.clip(np.round(smoothed), 0, 255).astype(np.uint8)
-        # Wo vorher Niederschlag war, bleibt mindestens Stufe 1 (Niesel) erhalten
-        smoothed_out[(smoothed_out == 0) & mask_active] = 1
-        smoothed_out[~mask_active] = 0
+        smoothed_out[smoothed < 0.6] = 0
         return smoothed_out
 
     except ImportError:
@@ -199,7 +197,7 @@ DWD_RADAR_STATIONS = [
 
 _TOWER_ZONE_MASK_1200x1100 = None
 
-def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=22):
+def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=10):
     """
     Erstellt eine boolesche Maske (1200x1100) aller 17 DWD-Radartürme.
     Im Radius von 22 km (22 Pixel) um die Antennen können Inversions-Clutter,
@@ -249,14 +247,11 @@ def remove_isolated_radar_clutter(val):
     2. Ganzheitliche Cluster-Beurteilung (8er-Konnektivität):
        Jedes Niederschlagsfeld wird als zusammenhängendes physikalisches Objekt bewertet.
        Es werden NIEMALS Pixel innerhalb eines Clusters abgeschnitten.
-    3. Turm-Zonierung (Radius 22 km um alle 17 DWD-Türme):
-       Schwache Echos (val <= 2) im 22-km-Nahbereich von Radartürmen werden eliminiert,
-       sofern nicht eine echte, durchziehende Großfront (>= 150 Pixel) oder ein
-       Schauerkern (val >= 4) vorliegt (eliminiert abendliche Inversions-Donuts).
-    4. Großflächiger Nieselregen / Landregen:
-       Zusammenhängende Nieselfelder ab 25 Pixeln (~25 km²) bleiben vollflächig in ihrer
-       natürlichen, organischen Kontur erhalten.
-    5. Fronten-Anbindung:
+    3. Turm-Schutz (Radius 10 km):
+       Echte Regengebiete (>= 20 Pixel) dürfen auch im Nahbereich von Radartürmen existieren
+       und werden nicht mehr künstlich ausgeschnitten oder unterdrückt.
+       Nur isoliertes Kleinst-Rauschen (< 20 Pixel ohne Frontenbezug) wird entfernt.
+    4. Fronten-Anbindung:
        Kleinere Satelliten-Fragmente (>= 10 Pixel) im 12-km-Umfeld einer sicheren Front
        werden als Ganzes mitgeschützt.
     """
@@ -282,8 +277,8 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        # 3. Turm-Maske der 17 Radarstandorte (22 km Inversions-Radius)
-        tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=22)
+        # 3. Turm-Maske der 17 Radarstandorte (10 km kompakter Antennen-Nahbereich)
+        tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=10)
         tower_overlap = nd_sum(tower_mask.astype(int), labels=labeled_array, index=indices)
         is_near_tower = tower_overlap > 0
 
@@ -291,14 +286,15 @@ def remove_isolated_radar_clutter(val):
         # A. Echter Schauer-/Regenkern (val >= 3 bzw. >= 0.36 mm/h) ab 15 Pixeln
         has_shower_core = (cluster_maxs >= 3) & (cluster_sizes >= 15)
 
-        # B. Zusammenhängender Nieselregen / Landregen (>= 25 Pixel) AUSSERHALB von Türmen
-        is_large_rain_field = (cluster_sizes >= 25) & (~is_near_tower)
+        # B. Zusammenhängender Nieselregen / Landregen (>= 20 Pixel):
+        # Echte Regengebiete dürfen uneingeschränkt auch im Turmbereich ziehen!
+        is_large_rain_field = (cluster_sizes >= 20)
 
-        # C. Echte durchziehende Großfront über einem Turm (>= 150 Pixel) ODER mit Kern (val >= 4)
-        is_massive_front_over_tower = ((cluster_sizes >= 150) | (cluster_maxs >= 4)) & is_near_tower
+        # C. Echte durchziehende Großfront (>= 100 Pixel)
+        is_massive_front = (cluster_sizes >= 100)
 
         # Sichere Basis-Fronten:
-        is_sure_front = has_shower_core | is_large_rain_field | is_massive_front_over_tower
+        is_sure_front = has_shower_core | is_large_rain_field | is_massive_front
         sure_ids = indices[is_sure_front]
 
         # 5. Fronten-Anbindung für kleinere Satelliten-Fragmente im 12-km-Umfeld:
@@ -310,10 +306,10 @@ def remove_isolated_radar_clutter(val):
         else:
             has_front_support = np.zeros_like(indices, dtype=bool)
 
-        # Cluster ist valide, wenn es eine Basisfront ist ODER frontengestützt (mindestens 10 Pixel, nicht im Turmbereich)
-        is_valid_cluster = is_sure_front | (has_front_support & (~is_near_tower) & (cluster_sizes >= 10))
+        # Cluster ist valide, wenn es eine Basisfront ist ODER frontengestützt:
+        # Nur isolierter Kleinst-Clutter (< 20 Pixel ohne Frontenanschluss) wird gelöscht.
+        is_valid_cluster = is_sure_front | (has_front_support & (cluster_sizes >= 10))
 
-        # 6. Nur ungültige Cluster als Ganzes entfernen (niemals einzelne Pixel in gültigen Clustern abschneiden!)
         invalid_cluster_ids = indices[~is_valid_cluster]
 
         clean_val = val.copy()
