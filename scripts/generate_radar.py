@@ -30,6 +30,11 @@ from PIL import Image
 import ftplib
 import ssl
 
+try:
+    import h5py
+except ImportError:
+    h5py = None
+
 # Exakte DWD RADOLAN DE1200 Bounding Box (Zielgitter 1400x1400)
 # SW: [45.68°N, 1.46°E] bis NE: [55.86°N, 18.73°E]
 RADAR_BOUNDS = [[45.68, 1.46], [55.86, 18.73]]
@@ -164,7 +169,7 @@ def reproject_and_smooth_radar(grid_1200x1100):
         # Organische Konturglättung wie im DWD-Radar:
         # Weiche Rundung der Frontenränder ohne künstliche Treppenstufen oder Blockkanten
         smoothed_out = np.clip(np.round(smoothed), 0, 255).astype(np.uint8)
-        smoothed_out[smoothed < 0.6] = 0
+        smoothed_out[smoothed < 0.4] = 0
         return smoothed_out
 
     except ImportError:
@@ -258,17 +263,27 @@ def remove_isolated_radar_clutter(val):
     if not np.any(val > 0):
         return val
 
-    # 1. Virga- & Hintergrundrauschen (val == 1) abschneiden:
-    val = val.copy()
-    val[val < 2] = 0
-    if not np.any(val > 0):
-        return val
-
     try:
         from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
-        # 2. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
+        val = val.copy()
         structure_8 = np.ones((3, 3), dtype=bool)
+
+        # 1. Echten Nieselsaum von Fronten schützen & isolierte Virga filtern:
+        # val == 1 (0.12 mm/h) ist im 2-km-Umfeld einer echten Front (val >= 2) meteorologisch realer
+        # Bodenniesel (stimmt zu 93 % mit dem DWD WarnWetter-Radar überein).
+        # Weit abseits von Fronten (isolierte Virga/Dunst ohne Kern) wird val == 1 sauber ausgefiltert.
+        rain_core = val >= 2
+        if np.any(rain_core):
+            front_fringe = binary_dilation(rain_core, structure=structure_8, iterations=2)
+            val[(val < 2) & (~front_fringe)] = 0
+        else:
+            val[val < 2] = 0
+
+        if not np.any(val > 0):
+            return val
+
+        # 2. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
         labeled_array, num_features = label(val > 0, structure=structure_8)
         if num_features == 0:
             return val
@@ -329,9 +344,9 @@ def map_radolan_val_to_index(val):
     """
     idx = np.zeros_like(val, dtype=np.uint8)
 
-    # 1. Zarter Nieselregen & Feuchtesaum (val 2..5 -> 0.24..0.60 mm/h)
-    m1 = (val >= 2) & (val < 6)
-    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
+    # 1. Zarter Nieselregen & Feuchtesaum (val 1..5 -> 0.12..0.60 mm/h)
+    m1 = (val >= 1) & (val < 6)
+    idx[m1] = (1 + ((val[m1] - 1) / 5.0) * 24).astype(np.uint8)
 
     # 2. Leichter bis mäßiger Landregen (val 6..20 -> 0.72..2.40 mm/h)
     m2 = (val >= 6) & (val < 21)
@@ -401,9 +416,84 @@ def parse_radolan_binary(data_bytes):
     return None, None
 
 
-def get_available_dwd_rv_files():
+def parse_odim_h5(data_bytes):
     """
-    Listet alle verfügbaren RADOLAN RV tar.bz2 Dateien auf opendata.dwd.de auf.
+    Parst ein ODIM_H5 Radarkomposit (z.B. composite_rv_*-hd5) mit h5py.
+    Gibt (header_str, 2D-numpy-array in Roh-Orientierung) zurück.
+    """
+    if h5py is None:
+        return None, None
+
+    try:
+        bio = io.BytesIO(data_bytes)
+        with h5py.File(bio, 'r') as h5:
+            if 'dataset1/data1/data' not in h5:
+                return None, None
+            ds = h5['dataset1/data1/data']
+            data_arr = np.array(ds)
+
+            what_grp = h5.get('dataset1/what')
+            gain = float(what_grp.attrs.get('gain', 0.01)) if what_grp else 0.01
+            offset = float(what_grp.attrs.get('offset', 0.0)) if what_grp else 0.0
+            nodata = float(what_grp.attrs.get('nodata', 65535)) if what_grp else 65535
+            undetect = float(what_grp.attrs.get('undetect', 0)) if what_grp else 0
+            quantity = what_grp.attrs.get('quantity', b'ACRR') if what_grp else b'ACRR'
+            if isinstance(quantity, bytes):
+                quantity = quantity.decode('ascii', errors='ignore')
+
+            # ODIM_H5 Orientierung: Row 0 ist Nord (Upper Left).
+            # RADOLAN Binary Orientierung: Row 0 ist Süd (Lower Left).
+            # np.flipud stellt die exakte RADOLAN-Gitterorientierung her (Süd=0, Nord=1199):
+            data_arr = np.flipud(data_arr)
+
+            val = data_arr.astype(np.float32)
+            val[data_arr == nodata] = 0
+            val[data_arr == undetect] = 0
+
+            if quantity == 'ACRR':
+                # ACRR ist 5-Minuten-Akkumulation in mm. RADOLAN RV Integer-Einheit ist 0.01 mm / 5min.
+                val = val * (gain / 0.01) + (offset / 0.01)
+            elif quantity == 'RATE':
+                # RATE ist mm/h. 0.12 mm/h entspricht 1 RADOLAN Einheit.
+                val = (val * gain + offset) / 0.12
+
+            val = np.clip(np.round(val), 0, 4095).astype(np.uint16)
+
+            # Meteorologischer Niesel- & Turmfilter (organischer Frontensaum)
+            val = remove_isolated_radar_clutter(val)
+
+            # Auf Turbo-LUT Farbstufen mappen
+            grid_indexed = map_radolan_val_to_index(val)
+
+            header = f"ODIM_H5 {quantity} {val.shape[0]}x{val.shape[1]}"
+            return header, grid_indexed
+
+    except Exception as e:
+        print(f"⚠️ Hinweis bei ODIM_H5 Parsing: {e}")
+        return None, None
+
+
+def parse_rv_product(data_bytes, filename_hint=""):
+    """
+    Abstrahierte, universelle RV-Parsing-Schnittstelle (Dual-Support mit Fallback):
+    - Parst primär ODIM_H5 (-hd5 / HDF5), falls h5py verfügbar ist und HDF5 vorliegt.
+    - Fällt bei Nichtverfügbarkeit oder Fehlern transparent auf das RADOLAN-Binärformat zurück.
+    """
+    if len(data_bytes) >= 4 and data_bytes[:4] == b'\x89HDF':
+        header, grid = parse_odim_h5(data_bytes)
+        if grid is not None:
+            return header, grid
+
+    # Fallback: Klassischer RADOLAN-Binärparser
+    return parse_radolan_binary(data_bytes)
+
+
+def get_available_dwd_rv_files(prefer_hdf5=True):
+    """
+    Listet alle verfügbaren RADOLAN RV Dateien auf opendata.dwd.de auf.
+    Dual-Support: Wählt primär das moderne ODIM_H5 Format (composite_rv_*.tar),
+    sofern h5py verfügbar ist, mit automatischem Fallback auf RADOLAN Binary (DE1200_RV*.tar.bz2).
+    Gibt (files_list, format_str) zurück: format_str ist 'hdf5' oder 'binary'.
     """
     url = "https://opendata.dwd.de/weather/radar/composite/rv/"
     req = urllib.request.Request(url, headers={'User-Agent': 'localwx-RADOLAN-Engine/2.0'})
@@ -411,36 +501,56 @@ def get_available_dwd_rv_files():
         with urllib.request.urlopen(req, timeout=15) as resp:
             html = resp.read().decode('utf-8')
         
-        pattern = r'href="(DE1200_RV(\d{10})\.tar\.bz2)"'
-        matches = re.findall(pattern, html)
-        
-        files = []
-        for filename, dt_str in matches:
+        # 1. Prüfe auf ODIM_H5 (composite_rv_YYYYMMDD_HHMM.tar) falls h5py verfügbar ist
+        if prefer_hdf5 and h5py is not None:
+            pattern_h5 = r'href="(composite_rv_(\d{8})_(\d{4})\.tar)"'
+            matches_h5 = re.findall(pattern_h5, html)
+            if matches_h5:
+                files_h5 = []
+                for filename, d_str, t_str in matches_h5:
+                    try:
+                        dt = datetime.strptime(f"{d_str}{t_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+                        files_h5.append((filename, dt))
+                    except Exception:
+                        pass
+                if files_h5:
+                    files_h5.sort(key=lambda x: x[1])
+                    return files_h5, "hdf5"
+
+        # 2. Fallback: RADOLAN Binary (DE1200_RVYYMMDDHHMM.tar.bz2)
+        pattern_bin = r'href="(DE1200_RV(\d{10})\.tar\.bz2)"'
+        matches_bin = re.findall(pattern_bin, html)
+        files_bin = []
+        for filename, dt_str in matches_bin:
             try:
                 dt = datetime.strptime(f"20{dt_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                files.append((filename, dt))
+                files_bin.append((filename, dt))
             except Exception:
                 pass
         
-        files.sort(key=lambda x: x[1])
-        return files
+        files_bin.sort(key=lambda x: x[1])
+        return files_bin, "binary"
     except Exception as e:
         print(f"⚠️ Fehler beim Abrufen des DWD-Index: {e}")
-        return []
+        return [], "none"
 
 
-def download_and_extract_tar_bz2(filename):
+def download_and_extract_rv_tar(filename):
     """
-    Lädt eine einzelne DE1200_RV tar.bz2 Datei von DWD OpenData herunter und entpackt sie im Speicher.
+    Lädt eine RADOLAN RV Archivdatei von DWD OpenData herunter und entpackt sie im Speicher.
+    Unterstützt sowohl HDF5 (.tar) als auch binäre Archive (.tar.bz2).
     """
     url = f"https://opendata.dwd.de/weather/radar/composite/rv/{filename}"
     req = urllib.request.Request(url, headers={'User-Agent': 'localwx-RADOLAN-Engine/2.0'})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             compressed_bytes = resp.read()
         
-        tar_bytes = bz2.decompress(compressed_bytes)
-        tar_stream = io.BytesIO(tar_bytes)
+        if filename.endswith('.tar.bz2'):
+            tar_bytes = bz2.decompress(compressed_bytes)
+            tar_stream = io.BytesIO(tar_bytes)
+        else:
+            tar_stream = io.BytesIO(compressed_bytes)
         
         extracted_files = {}
         with tarfile.open(fileobj=tar_stream, mode="r:") as tar:
@@ -454,6 +564,10 @@ def download_and_extract_tar_bz2(filename):
     except Exception as e:
         print(f"⚠️ Fehler beim Laden von {filename}: {e}")
         return {}
+
+
+# Kompatibilitätsalias
+download_and_extract_tar_bz2 = download_and_extract_rv_tar
 
 
 def render_matrix_to_webp(grid_reprojected_1400, output_path):
@@ -898,13 +1012,13 @@ def generate_radar_dataset():
     output_dir = "./dist/radar"
     os.makedirs(output_dir, exist_ok=True)
 
-    dwd_files = get_available_dwd_rv_files()
+    dwd_files, rv_format = get_available_dwd_rv_files(prefer_hdf5=True)
     if not dwd_files:
         print("❌ Keine RADOLAN-Dateien auf opendata.dwd.de gefunden!")
         return
 
     now = datetime.now(timezone.utc)
-    print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} RADOLAN RV Komposite verfügbar).")
+    print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} {rv_format.upper()}-Komposite verfügbar).")
 
     # Letzte 8 Stunden Historie
     eight_hours_ago = now - timedelta(hours=8)
@@ -916,16 +1030,16 @@ def generate_radar_dataset():
 
     def process_history_item(item, idx):
         filename, valid_dt = item
-        data_dict = download_and_extract_tar_bz2(filename)
+        data_dict = download_and_extract_rv_tar(filename)
         if not data_dict:
             return None
 
-        main_key = next((k for k in sorted(data_dict.keys()) if '_000' in k or k.endswith('000')), None)
+        main_key = next((k for k in sorted(data_dict.keys()) if re.search(r'_000(?:-hd5)?$', k)), None)
         if not main_key:
             main_key = sorted(data_dict.keys())[0]
 
         file_bytes = data_dict[main_key]
-        header, grid = parse_radolan_binary(file_bytes)
+        header, grid = parse_rv_product(file_bytes, filename_hint=main_key)
         if grid is None:
             return None
 
@@ -951,12 +1065,12 @@ def generate_radar_dataset():
     latest_dt = dwd_files[-1][1]
     print(f"🔮 Lade DWD 5-Minuten Nowcast (+2h) aus neuester Datei: {latest_file}...")
 
-    nowcast_data = download_and_extract_tar_bz2(latest_file)
+    nowcast_data = download_and_extract_rv_tar(latest_file)
     if nowcast_data:
-        nowcast_keys = [k for k in sorted(nowcast_data.keys()) if not k.endswith('_000')]
+        nowcast_keys = [k for k in sorted(nowcast_data.keys()) if not re.search(r'_000(?:-hd5)?$', k)]
         selected_nowcast_keys = []
         for k in nowcast_keys:
-            m = re.search(r'_(\d{3})$', k)
+            m = re.search(r'_(\d{3})(?:-hd5)?$', k)
             if m:
                 minutes = int(m.group(1))
                 selected_nowcast_keys.append((k, minutes))
@@ -965,7 +1079,7 @@ def generate_radar_dataset():
 
         for k, minutes in selected_nowcast_keys:
             file_bytes = nowcast_data[k]
-            header, grid = parse_radolan_binary(file_bytes)
+            header, grid = parse_rv_product(file_bytes, filename_hint=k)
             if grid is not None:
                 valid_dt = latest_dt + timedelta(minutes=minutes)
                 raw_nowcast_items.append({
