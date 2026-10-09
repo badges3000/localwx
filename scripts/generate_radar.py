@@ -199,11 +199,11 @@ DWD_RADAR_STATIONS = [
 
 _TOWER_ZONE_MASK_1200x1100 = None
 
-def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=14):
+def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=22):
     """
     Erstellt eine boolesche Maske (1200x1100) aller 17 DWD-Radartürme.
-    Im Radius von 14 km (14 Pixel) um die Antennen können Clutter-Artefakte
-    wie Antennenringe, Bodenreflexionen oder Turm-Rauschen auftreten.
+    Im Radius von 22 km (22 Pixel) um die Antennen können Inversions-Clutter,
+    Antennenringe, Bodenreflexionen oder Turm-Rauschen auftreten.
     Wird einmal vorberechnet und wiederverwendet.
     """
     global _TOWER_ZONE_MASK_1200x1100
@@ -240,23 +240,21 @@ def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=14):
 
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Niesel-Schutz- & Turm-Zonierungs-Filter:
+    Meteorologischer Niesel-Schutz- & Turm-Zonierungs-Filter (DWD-kalibriert):
     
-    Kombination aus Turm-Zonierung (Vorschlag 1) und 8er-Konnektivität (Vorschlag 2):
-    
-    1. 8er-Konnektivität: Pixel verbinden sich auch diagonal, sodass feine Nieselbänder 
-       nicht in Fragmente zerschnitten werden.
-    2. Entkoppelung der Schauerkern-Pflicht:
-       - Großflächige Nieselfelder (>= 25 Pixel) sind echter stratiformer Regen
-         und benötigen KEINEN Schauerkern (val >= 4).
-       - Kleine Zellen (< 25 Pixel) werden anerkannt, wenn sie einen Kern haben (val >= 4)
-         oder innerhalb von 20 km um eine aktive Regenfront liegen (Dilatations-Schutz).
-    3. Gezielte Turm-Zonierung:
-       - Nur in der 14-km-Nahbereichszone um die 17 DWD-Radartürme wird streng gefiltert:
-         Kleine schwache Echos (< 80 Pixel ohne echten Kern) werden als Antennen-Clutter/Ringe gelöscht.
-       - Außerhalb der Turmzonen (Ostsee, Binnenland) bleibt feiner Nieselregen (val >= 1) voll erhalten!
-    4. Nur isoliertes Salt-and-Pepper-Rauschen (< 10 Pixel ohne Kern und ohne räumlichen Bezug)
-       wird eliminiert.
+    1. Physikalische Niesel-Stützung:
+       Reiner Schwachniederschlag (val == 1, entspricht 0.12 mm/h) ist nur dort echter
+       Bodenniederschlag, wo er im räumlichen Umfeld (<= 8 km) einer Front mit val >= 2 liegt.
+       Großflächige, rein isolierte val == 1 Felder ohne jeden Pixel val >= 2 sind
+       Virga (verdunstende Höhenfeuchte), Antennenrauschen oder Turm-Clutter und werden entfernt.
+    2. 8er-Konnektivität auf bereinigtem Raster:
+       Niederschlagsgebiete verbinden sich natürlich, ohne dass feine Bänder zerreißen.
+    3. Turm-Zonierung (Radius 22 km um alle 17 DWD-Türme):
+       Schwache Echos ohne echten Schauerkern (val <= 2) werden im 22-km-Umfeld
+       von Radartürmen restlos eliminiert (verhindert abendliche Inversions-Donuts).
+    4. Gezielte Dilatation:
+       Schützt den feinen Nieselsaum gezielt im 12-km-Umfeld um Niederschlagskerne (val >= 3),
+       ohne ins trockene Umland auszuwuchern.
     """
     if not np.any(val > 0):
         return val
@@ -264,7 +262,20 @@ def remove_isolated_radar_clutter(val):
     try:
         from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
-        # 1. 8er-Konnektivität für natürliche, zusammenhängende Niederschlagsflächen
+        # 1. Physikalische Niesel-Stützung gegen Virga & freies Antennenrauschen:
+        # val == 1 (0.12 mm/h) darf als feiner Außensaum existieren, wenn im 8-km-Umfeld val >= 2 liegt.
+        # Isolierte val == 1 Rauschteppiche ohne jeglichen Messwert >= 0.24 mm/h werden gelöscht.
+        has_precip_body = val >= 2
+        if np.any(has_precip_body):
+            precip_fringe_zone = binary_dilation(has_precip_body, iterations=8)
+            val[(val == 1) & (~precip_fringe_zone)] = 0
+        else:
+            val[val == 1] = 0
+
+        if not np.any(val > 0):
+            return val
+
+        # 2. 8er-Konnektivität für natürliche, zusammenhängende Niederschlagsflächen
         structure_8 = np.ones((3, 3), dtype=bool)
         labeled_array, num_features = label(val > 0, structure=structure_8)
         if num_features == 0:
@@ -274,41 +285,34 @@ def remove_isolated_radar_clutter(val):
         cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
         cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
 
-        # Turm-Maske der 17 Radarstandorte abrufen
-        tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=14)
-        
-        # Prüfen, wie viele Pixel jedes Clusters in einer Turm-Nahbereichszone liegen
+        # Turm-Maske der 17 Radarstandorte abrufen (22 km Inversions-Radius)
+        tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=22)
         tower_overlap = nd_sum(tower_mask.astype(int), labels=labeled_array, index=indices)
         is_near_tower = tower_overlap > 0
 
-        # 2. Klassifikation der Cluster:
-        # A. Konvektiver Schauerkern (val >= 4) -> IMMER valide (überall)
-        has_shower_core = cluster_maxs >= 4
+        # 3. Klassifikation der Cluster:
+        # A. Echter Schauer-/Regenkern (val >= 3 bzw. >= 0.36 mm/h) -> IMMER valide (überall)
+        has_shower_core = cluster_maxs >= 3
 
-        # B. Großflächiger stratiformer Nieselregen / Landregen (>= 25 Pixel) AUSSERHALB von Türmen
-        is_large_rain_field = (cluster_sizes >= 25) & (~is_near_tower)
+        # B. Großflächiger stratiformer Landregen / Nieselregen (>= 40 Pixel) AUSSERHALB von Türmen
+        is_large_rain_field = (cluster_sizes >= 40) & (~is_near_tower)
 
-        # C. Großes Gebiet auch in Turmnähe (>= 80 Pixel, also echte durchziehende Front über dem Turm)
-        is_massive_front_over_tower = (cluster_sizes >= 80) & is_near_tower
+        # C. Echte durchziehende Großfront über einem Turm (>= 150 Pixel)
+        is_massive_front_over_tower = (cluster_sizes >= 150) & is_near_tower
 
         # Primär sichere Regenfronten:
         is_sure_front = has_shower_core | is_large_rain_field | is_massive_front_over_tower
         sure_ids = indices[is_sure_front]
 
-        # 3. Nieselbrücken-Schutz: Dehne sichere Regenfronten um 20 Pixel (~20 km) aus
+        # 4. Gezielte Nieselbrücke: Dehne sichere Regenfronten um 12 Pixel (~12 km) aus
         sure_mask = np.isin(labeled_array, sure_ids)
-        expanded_zone = binary_dilation(sure_mask, iterations=20)
+        expanded_zone = binary_dilation(sure_mask, iterations=12)
 
-        # 4. Sekundäre Cluster prüfen (kleine Inseln < 25 Pixel):
-        # Wenn sie in der 20-km-Erweiterungszone um sichere Fronten liegen, sind es echte Niesel-Ausläufer!
+        # 5. Sekundäre Cluster prüfen:
         zone_overlap = nd_sum(expanded_zone.astype(int), labels=labeled_array, index=indices)
         has_front_support = zone_overlap > 0
 
-        # Validierungs-Kriterium:
-        # - Sichere Front (groß oder mit Kern)
-        # - ODER kleiner Nieselcluster mit räumlichem Frontenbezug (solange nicht isolierter Turm-Clutter)
-        is_valid_cluster = is_sure_front | (has_front_support & (~is_near_tower)) | (has_front_support & (cluster_sizes >= 15))
-
+        is_valid_cluster = is_sure_front | (has_front_support & (~is_near_tower)) | (has_front_support & (cluster_sizes >= 25))
         invalid_cluster_ids = indices[~is_valid_cluster]
 
         clean_val = val.copy()
@@ -316,15 +320,15 @@ def remove_isolated_radar_clutter(val):
             is_invalid_pixel = np.isin(labeled_array, invalid_cluster_ids)
             clean_val[is_invalid_pixel] = 0
 
-        # 5. Spezieller Schutz in unmittelbarer Turmnähe (Radius <= 8 km):
-        # Isoliertes schwaches val == 1 direkt am Turmfuß (Antennen-Reflexion) säubern
-        direct_tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=8)
-        is_direct_tower_noise = direct_tower_mask & (clean_val == 1) & (~expanded_zone)
-        clean_val[is_direct_tower_noise] = 0
+        # 6. Schutz vor Turm-Donuts im 22-km-Radius:
+        # Schwaches Rest-Rauschen (val <= 2) im Turmbereich ohne Stütze durch eine Großfront eliminieren
+        is_tower_donut_clutter = tower_mask & (clean_val <= 2) & (~sure_mask)
+        clean_val[is_tower_donut_clutter] = 0
 
         return clean_val
     except ImportError:
         return val
+
 
 
 def map_radolan_val_to_index(val):
