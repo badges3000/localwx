@@ -33,7 +33,15 @@ import ssl
 try:
     import h5py
 except ImportError:
-    h5py = None
+    try:
+        import subprocess
+        print("📦 'h5py' nicht im Environment gefunden – installiere automatisch via pip...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "h5py", "--quiet"])
+        import h5py
+        print("✅ 'h5py' erfolgreich installiert und geladen!")
+    except Exception as e:
+        print(f"⚠️ Automatisches Installieren von h5py fehlgeschlagen: {e}")
+        h5py = None
 
 # Exakte DWD RADOLAN DE1200 Bounding Box (Zielgitter 1400x1400)
 # SW: [45.68°N, 1.46°E] bis NE: [55.86°N, 18.73°E]
@@ -422,7 +430,7 @@ def parse_odim_h5(data_bytes):
             ds = h5['dataset1/data1/data']
             data_arr = np.array(ds)
 
-            what_grp = h5.get('dataset1/what')
+            what_grp = h5.get('dataset1/data1/what') or h5.get('dataset1/what')
             gain = float(what_grp.attrs.get('gain', 0.01)) if what_grp else 0.01
             offset = float(what_grp.attrs.get('offset', 0.0)) if what_grp else 0.0
             nodata = float(what_grp.attrs.get('nodata', 65535)) if what_grp else 65535
@@ -481,8 +489,8 @@ def parse_rv_product(data_bytes, filename_hint=""):
 def get_available_dwd_rv_files(prefer_hdf5=True):
     """
     Listet alle verfügbaren RADOLAN RV Dateien auf opendata.dwd.de auf.
-    Dual-Support: Wählt primär das moderne ODIM_H5 Format (composite_rv_*.tar),
-    sofern h5py verfügbar ist, mit automatischem Fallback auf RADOLAN Binary (DE1200_RV*.tar.bz2).
+    Dual-Support: Wählt primär das moderne ODIM_H5 Format (composite_rv_*.tar).
+    Stellt sicher, dass nicht auf veraltete/eingestellte Binärdateien zurückgegriffen wird.
     Gibt (files_list, format_str) zurück: format_str ist 'hdf5' oder 'binary'.
     """
     url = "https://opendata.dwd.de/weather/radar/composite/rv/"
@@ -491,21 +499,35 @@ def get_available_dwd_rv_files(prefer_hdf5=True):
         with urllib.request.urlopen(req, timeout=15) as resp:
             html = resp.read().decode('utf-8')
         
-        # 1. Prüfe auf ODIM_H5 (composite_rv_YYYYMMDD_HHMM.tar) falls h5py verfügbar ist
-        if prefer_hdf5 and h5py is not None:
-            pattern_h5 = r'href="(composite_rv_(\d{8})_(\d{4})\.tar)"'
-            matches_h5 = re.findall(pattern_h5, html)
-            if matches_h5:
-                files_h5 = []
-                for filename, d_str, t_str in matches_h5:
-                    try:
-                        dt = datetime.strptime(f"{d_str}{t_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                        files_h5.append((filename, dt))
-                    except Exception:
-                        pass
-                if files_h5:
-                    files_h5.sort(key=lambda x: x[1])
-                    return files_h5, "hdf5"
+        # 1. Prüfe auf ODIM_H5 (composite_rv_YYYYMMDD_HHMM.tar)
+        pattern_h5 = r'href="(composite_rv_(\d{8})_(\d{4})\.tar)"'
+        matches_h5 = re.findall(pattern_h5, html)
+        files_h5 = []
+        if matches_h5:
+            for filename, d_str, t_str in matches_h5:
+                try:
+                    dt = datetime.strptime(f"{d_str}{t_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+                    files_h5.append((filename, dt))
+                except Exception:
+                    pass
+            files_h5.sort(key=lambda x: x[1])
+
+        # Prüfe, ob h5py einsatzbereit ist
+        global h5py
+        if prefer_hdf5 and files_h5:
+            if h5py is None:
+                try:
+                    import subprocess
+                    print("📦 'h5py' für ODIM_H5 wird nachinstalliert...")
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "h5py", "--quiet"])
+                    import h5py as _h5
+                    h5py = _h5
+                    print("✅ 'h5py' erfolgreich bereitgestellt!")
+                except Exception as e:
+                    print(f"⚠️ h5py-Installation fehlgeschlagen: {e}")
+
+            if h5py is not None:
+                return files_h5, "hdf5"
 
         # 2. Fallback: RADOLAN Binary (DE1200_RVYYMMDDHHMM.tar.bz2)
         pattern_bin = r'href="(DE1200_RV(\d{10})\.tar\.bz2)"'
@@ -517,9 +539,32 @@ def get_available_dwd_rv_files(prefer_hdf5=True):
                 files_bin.append((filename, dt))
             except Exception:
                 pass
-        
         files_bin.sort(key=lambda x: x[1])
-        return files_bin, "binary"
+
+        now = datetime.now(timezone.utc)
+
+        # WICHTIG: Der DWD hat die Binärdateien am 20.10.2026 eingestellt.
+        # Wenn die Binärdateien älter als 3 Stunden sind, aber frische HDF5-Dateien vorliegen:
+        # Niemals die toten Binärdateien nutzen!
+        if files_h5 and (not files_bin or (now - files_bin[-1][1]).total_seconds() > 3 * 3600):
+            print("⚠️ DWD Binär-Feed ist veraltet/eingestellt (>3h alt). Erzwinge ODIM_H5 Modus!")
+            if h5py is None:
+                try:
+                    import subprocess
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "h5py", "--quiet"])
+                    import h5py as _h5
+                    h5py = _h5
+                except Exception as e:
+                    print(f"❌ Kritischer Fehler: ODIM_H5 zwingend erforderlich, aber h5py fehlt: {e}")
+            if h5py is not None:
+                return files_h5, "hdf5"
+
+        if files_bin:
+            return files_bin, "binary"
+        elif files_h5 and h5py is not None:
+            return files_h5, "hdf5"
+
+        return [], "none"
     except Exception as e:
         print(f"⚠️ Fehler beim Abrufen des DWD-Index: {e}")
         return [], "none"
@@ -1010,9 +1055,14 @@ def generate_radar_dataset():
     now = datetime.now(timezone.utc)
     print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} {rv_format.upper()}-Komposite verfügbar).")
 
-    # Letzte 8 Stunden Historie
+    # Letzte 8 Stunden Historie (-8h bis jetzt mit 10 Min Puffer)
     eight_hours_ago = now - timedelta(hours=8)
-    selected_history = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now]
+    selected_history = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now + timedelta(minutes=10)]
+
+    # Failsafe: Falls Zeitfilter keine Dateien matcht (z.B. bei Serveruhr-Differenzen),
+    # nimm stets die letzten bis zu 96 verfügbaren Messungen (8h):
+    if not selected_history and dwd_files:
+        selected_history = dwd_files[-96:]
 
     print(f"📦 Lade {len(selected_history)} lückenlose 5-Minuten-Messungen (-8h bis Jetzt)...")
 
