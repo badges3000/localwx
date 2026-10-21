@@ -5,9 +5,10 @@ DWD RADOLAN HD Turbo-Niederschlagsradar Generator & Uploader (100% DWD OpenData)
 Lädt hochauflösende DWD RADOLAN HD Radardaten im lückenlosen 5-Minuten-Takt von opendata.dwd.de:
 - -8h bis 0h Vergangenheit: Alle 5-Minuten-Messungen (DWD RADOLAN RV)
 - 0h bis +2h Nowcasting: Alle 5-Minuten-Vorhersageschritte (+5m bis +120m)
+- Automatischer Aktualitäts-Check zwischen ODIM_H5 (.tar) und RADOLAN Binary (.tar.bz2)
 - Exakte Polar-Stereographische Entzerrung (Warp auf EPSG:4326/Leaflet)
 - Organische Isolinien-Glättung im DWD WarnWetter / Kachelmann Vektor-Stil
-- Nieselbrücken-Schutz via morphologischer Dilatation für lückenlose Regenfronten
+- Lückenloser Durchzug über Radartürme (inkl. Totkegel-Heilung / Cone-of-Silence Inpainting)
 - Bidirektionaler 3-Stufen Temporalfilter gegen Flickern, Wegploppen und Artefakte
 - 100% verlustfreies WebP (lossless=True, method=6)
 - Erzeugt meta.json und lädt per FTPS nach /data/radar/ hoch.
@@ -53,20 +54,18 @@ def build_turbo_lut():
             r, g, b, a = 0, 0, 0, 0
         elif i < 26:
             # 1 - 25: Leuchtender Türkis / Cyan Nieselsaum (0.12 - 0.60 mm/h)
-            # Hohe Opazität und brillantes Cyan für maximale Erkennbarkeit über Land & Meer
             t = (i - 1) / 24.0
             r = int(15 + t * 25)
             g = int(205 + t * 25)
             b = int(255 - t * 15)
-            a = int(220 + t * 35)  # 86% bis 100% Deckkraft: Brillanter Kontrast auf Dark-Basemap
+            a = int(210 + t * 45)
         elif i < 91:
             # 26 - 90: Satte Smaragd- & Lime-Grüntöne (0.72 - 2.40 mm/h)
-            # Bildet wie in der WarnWetter App die voll deckende Hauptmasse des Regens
             t = (i - 26) / 64.0
             r = int(45 + t * 125)
             g = int(218 + t * 25)
             b = int(70 - t * 55)
-            a = 255  # 100% Opazität für maximalen Kontrast über Land & Meer
+            a = 255
         elif i < 151:
             # 91 - 150: Leuchtendes Goldgelb bis Sonnengelb (2.52 - 6.60 mm/h)
             t = (i - 91) / 59.0
@@ -95,10 +94,11 @@ def build_turbo_lut():
             g = int(35 + t * 220)
             b = int(215 + t * 40)
             a = 255
-            
+
         lut[i] = [r, g, b, a]
 
     return lut
+
 
 TURBO_LUT = build_turbo_lut()
 
@@ -106,10 +106,11 @@ TURBO_LUT = build_turbo_lut()
 # Vorberechnete Reprojektions-Koordinaten für das 1400x1400 WGS84 Zielraster
 _WARP_COORDS = None
 
+
 def get_reprojection_coords(target_h=1400, target_w=1400):
     """
     Berechnet die exakte Polar-Stereographische Koordinatentransformation (DWD DE1200 -> Web Mercator EPSG:3857).
-    Wird einmalig vorberechnet und für alle 120 Frames wiederverwendet.
+    Wird einmalig vorberechnet und für alle Frames wiederverwendet.
     """
     global _WARP_COORDS
     if _WARP_COORDS is not None:
@@ -118,19 +119,16 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     lat_min, lat_max = RADAR_BOUNDS[0][0], RADAR_BOUNDS[1][0]
     lon_min, lon_max = RADAR_BOUNDS[0][1], RADAR_BOUNDS[1][1]
 
-    # DWD Spezifikation: Polar-stereographische Projektion
-    R = 6370.040  # Erdradius in km
-    lat_ts = np.radians(60.0)  # Standard-Parallele 60°N
-    lon_0 = np.radians(10.0)   # Zentralmeridian 10°E
+    R = 6370.040
+    lat_ts = np.radians(60.0)
+    lon_0 = np.radians(10.0)
     scale = R * (1.0 + np.sin(lat_ts))
 
-    # Exakte Web-Mercator (EPSG:3857) Breiten-Abtastung (Nord oben nach Süd unten):
     y_merc_max = np.log(np.tan(np.pi / 4.0 + np.radians(lat_max) / 2.0))
     y_merc_min = np.log(np.tan(np.pi / 4.0 + np.radians(lat_min) / 2.0))
     y_merc_grid = np.linspace(y_merc_max, y_merc_min, target_h)
     lats = np.degrees(2.0 * np.arctan(np.exp(y_merc_grid)) - np.pi / 2.0)
 
-    # Längengrade sind in Web Mercator und WGS84 linear:
     lons = np.linspace(lon_min, lon_max, target_w)
     lon_grid, lat_grid = np.meshgrid(lons, lats)
 
@@ -141,8 +139,6 @@ def get_reprojection_coords(target_h=1400, target_w=1400):
     x_proj = m * np.cos(phi) * np.sin(lam - lon_0)
     y_proj = -m * np.cos(phi) * np.cos(lam - lon_0)
 
-    # Offset der linken unteren Ecke (SW) im 1100x1200 RADOLAN Raster
-    # Exaktes DWD DE1200 Gitter: x_0 = -543.462 km, y_0 (South) = -4808.645 km
     x_px = x_proj + 543.462
     y_px = y_proj + 4808.645
 
@@ -159,21 +155,22 @@ def reproject_and_smooth_radar(grid_1200x1100):
         from scipy.ndimage import map_coordinates, gaussian_filter
 
         y_coords, x_coords = get_reprojection_coords(1400, 1400)
-        
-        # Reprojektion mit bilinearer Interpolation
-        warped = map_coordinates(grid_1200x1100.astype(np.float32), [y_coords, x_coords], order=1, mode='constant', cval=0.0)
-        
-        # Feine Isolinien-Glättung (sigma=0.75) für weiche, organische Fronten
+
+        warped = map_coordinates(
+            grid_1200x1100.astype(np.float32),
+            [y_coords, x_coords],
+            order=1,
+            mode='constant',
+            cval=0.0
+        )
+
         smoothed = gaussian_filter(warped, sigma=0.75)
-        
-        # Organische Konturglättung wie im DWD-Radar:
-        # Weiche Rundung der Frontenränder ohne künstliche Treppenstufen oder Blockkanten
+
         smoothed_out = np.clip(np.round(smoothed), 0, 255).astype(np.uint8)
         smoothed_out[smoothed < 0.6] = 0
         return smoothed_out
 
     except ImportError:
-        # Fallback falls scipy nicht verfügbar: Erst flippen (Nord oben), dann skalieren
         flipped = np.flipud(grid_1200x1100)
         img = Image.fromarray(flipped)
         return np.array(img.resize((1400, 1400), Image.BILINEAR))
@@ -200,29 +197,22 @@ DWD_RADAR_STATIONS = [
     {"id": "UMD", "name": "Ummendorf", "lat": 52.1601, "lon": 11.1761},
 ]
 
-_TOWER_ZONE_MASK_1200x1100 = None
+_TOWER_ZONE_CACHE = {}
+_TOWER_PIXEL_COORDS = None
 
-def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=10):
-    """
-    Erstellt eine boolesche Maske (1200x1100) aller 17 DWD-Radartürme.
-    Im Radius von 22 km (22 Pixel) um die Antennen können Inversions-Clutter,
-    Antennenringe, Bodenreflexionen oder Turm-Rauschen auftreten.
-    Wird einmal vorberechnet und wiederverwendet.
-    """
-    global _TOWER_ZONE_MASK_1200x1100
-    if _TOWER_ZONE_MASK_1200x1100 is not None:
-        return _TOWER_ZONE_MASK_1200x1100
 
-    mask = np.zeros((height, width), dtype=bool)
+def get_tower_pixel_coords(height=1200, width=1100):
+    """Berechnet die exakten (cy, cx) Gitterkoordinaten der 17 DWD-Radartürme."""
+    global _TOWER_PIXEL_COORDS
+    if _TOWER_PIXEL_COORDS is not None:
+        return _TOWER_PIXEL_COORDS
 
     R = 6370.040
     lat_ts = np.radians(60.0)
     lon_0 = np.radians(10.0)
     scale = R * (1.0 + np.sin(lat_ts))
 
-    y_grid, x_grid = np.ogrid[:height, :width]
-    r_sq = radius_km ** 2
-
+    coords = []
     for st in DWD_RADAR_STATIONS:
         phi = np.radians(st["lat"])
         lam = np.radians(st["lon"])
@@ -232,969 +222,98 @@ def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=10):
 
         cx = int(round(xp + 543.462))
         cy = int(round(yp + 4808.645))
-
         if 0 <= cx < width and 0 <= cy < height:
-            dist_sq = (x_grid - cx) ** 2 + (y_grid - cy) ** 2
-            mask |= (dist_sq <= r_sq)
+            coords.append((cy, cx))
 
-    _TOWER_ZONE_MASK_1200x1100 = mask
-    return _TOWER_ZONE_MASK_1200x1100
+    _TOWER_PIXEL_COORDS = coords
+    return coords
+
+
+def get_radar_tower_zone_mask(height=1200, width=1100, radius_km=6):
+    """
+    Erstellt eine boolesche Maske (1200x1100) für den unmittelbaren Nahbereich (6 km)
+    der 17 DWD-Radartürme.
+    """
+    cache_key = (height, width, radius_km)
+    if cache_key in _TOWER_ZONE_CACHE:
+        return _TOWER_ZONE_CACHE[cache_key]
+
+    mask = np.zeros((height, width), dtype=bool)
+    y_grid, x_grid = np.ogrid[:height, :width]
+    r_sq = radius_km ** 2
+
+    for cy, cx in get_tower_pixel_coords(height, width):
+        dist_sq = (x_grid - cx) ** 2 + (y_grid - cy) ** 2
+        mask |= (dist_sq <= r_sq)
+
+    _TOWER_ZONE_CACHE[cache_key] = mask
+    return mask
+
+
+def heal_radar_cone_of_silence(val):
+    """
+    Schließt das physikalische 'Totkegel-Loch' (Cone of Silence / DWD-Standortfilter)
+    direkt über den 17 Radartürmen (z. B. Rostock), wenn ein Regengebiet über den Turm zieht.
+    Wenn der Außenring (4 bis 9 km) um einen Turm zu >= 45 % im Regen liegt, werden
+    künstliche 0-Pixel im inneren 4-km-Kreis sanft mit dem Median des umgebenden Regens gefüllt.
+    """
+    h, w = val.shape
+    out = val.copy()
+
+    for cy, cx in get_tower_pixel_coords(h, w):
+        ymin, ymax = max(0, cy - 9), min(h, cy + 10)
+        xmin, xmax = max(0, cx - 9), min(w, cx + 10)
+
+        sub = out[ymin:ymax, xmin:xmax]
+        sy, sx = np.ogrid[ymin:ymax, xmin:xmax]
+        dist_sq = (sx - cx) ** 2 + (sy - cy) ** 2
+
+        outer_ring = (dist_sq > 16) & (dist_sq <= 81)  # 4 km bis 9 km Ring
+        inner_core = dist_sq <= 16                     # 0 km bis 4 km Totkegel
+
+        ring_vals = sub[outer_ring]
+        if ring_vals.size > 0:
+            active_ring = ring_vals[ring_vals > 0]
+            # Zieht gerade ein Regengebiet über den Turm hinweg?
+            if active_ring.size >= 0.45 * ring_vals.size:
+                fill_val = max(1, int(np.median(active_ring)))
+                hole_mask = inner_core & (sub == 0)
+                if np.any(hole_mask):
+                    sub[hole_mask] = fill_val
+
+    return out
 
 
 def remove_isolated_radar_clutter(val):
     """
-    Meteorologischer Niesel-Schutz- & Turm-Zonierungs-Filter (organisch, DWD-kalibriert):
-
-    1. Rohdaten-Filter:
-       val == 1 (0.12 mm/h) in den RADOLAN RV Rohdaten ist atmosphärisches Grundrauschen
-       und Virga (zu 63 % in der DWD WarnWetter App trocken). Echter Bodenniederschlag
-       beginnt ab val >= 2 (0.24 mm/h, 99 % Übereinstimmung mit DWD).
-    2. Ganzheitliche Cluster-Beurteilung (8er-Konnektivität):
-       Jedes Niederschlagsfeld wird als zusammenhängendes physikalisches Objekt bewertet.
-       Es werden NIEMALS Pixel innerhalb eines Clusters abgeschnitten.
-    3. Turm-Schutz (Radius 10 km):
-       Echte Regengebiete (>= 20 Pixel) dürfen auch im Nahbereich von Radartürmen existieren
-       und werden nicht mehr künstlich ausgeschnitten oder unterdrückt.
-       Nur isoliertes Kleinst-Rauschen (< 20 Pixel ohne Frontenbezug) wird entfernt.
-    4. Fronten-Anbindung:
-       Kleinere Satelliten-Fragmente (>= 10 Pixel) im 12-km-Umfeld einer sicheren Front
-       werden als Ganzes mitgeschützt.
+    Meteorologischer Niesel-Erhalt & Radarturm-Filter OHNE Ausstanzen:
+    - Es werden NIEMALS Löcher in durchziehende Regengebiete oder Nieselfelder gestanzt.
+    - Jedes Niederschlagsfeld wird immer nur als GANZES behalten oder (falls reines Störecho) entfernt.
+    - Am Radarturm (6 km Radius) werden nur winzige, komplett isolierte Stör-Flecken (< 35 Pixel,
+      val <= 2) gelöscht, sofern im Umkreis von 18 km kein echtes Regengebiet existiert.
+    - Zieht ein Regengebiet über einen Radarturm, schließt heal_radar_cone_of_silence()
+      sogar das physikalische Totkegel-Loch direkt über der Antenne.
     """
     if not np.any(val > 0):
         return val
 
-    # 1. Virga- & Hintergrundrauschen (val == 1) abschneiden:
     val = val.copy()
-    val[val < 2] = 0
-    if not np.any(val > 0):
-        return val
 
     try:
         from scipy.ndimage import label, maximum as nd_max, sum as nd_sum, binary_dilation
 
-        # 2. 8er-Konnektivität für natürliche, organische Niederschlagsfelder
         structure_8 = np.ones((3, 3), dtype=bool)
-        labeled_array, num_features = label(val > 0, structure=structure_8)
+        labeled, num_features = label(val >= 1, structure=structure_8)
         if num_features == 0:
             return val
 
-        indices = np.arange(1, num_features + 1)
-        cluster_sizes = nd_sum(np.ones_like(val), labels=labeled_array, index=indices)
-        cluster_maxs = nd_max(val, labels=labeled_array, index=indices)
-
-        # 3. Turm-Maske der 17 Radarstandorte (10 km kompakter Antennen-Nahbereich)
-        tower_mask = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=10)
-        tower_overlap = nd_sum(tower_mask.astype(int), labels=labeled_array, index=indices)
-        is_near_tower = tower_overlap > 0
-
-        # 4. Klassifikation der Cluster als GANZHEITLICHE Objekte:
-        # A. Echter Schauer-/Regenkern (val >= 3 bzw. >= 0.36 mm/h) ab 15 Pixeln
-        has_shower_core = (cluster_maxs >= 3) & (cluster_sizes >= 15)
-
-        # B. Zusammenhängender Nieselregen / Landregen (>= 20 Pixel):
-        # Echte Regengebiete dürfen uneingeschränkt auch im Turmbereich ziehen!
-        is_large_rain_field = (cluster_sizes >= 20)
-
-        # C. Echte durchziehende Großfront (>= 100 Pixel)
-        is_massive_front = (cluster_sizes >= 100)
-
-        # Sichere Basis-Fronten:
-        is_sure_front = has_shower_core | is_large_rain_field | is_massive_front
-        sure_ids = indices[is_sure_front]
-
-        # 5. Fronten-Anbindung für kleinere Satelliten-Fragmente im 12-km-Umfeld:
-        if len(sure_ids) > 0:
-            sure_mask = np.isin(labeled_array, sure_ids)
-            expanded_zone = binary_dilation(sure_mask, structure=structure_8, iterations=12)
-            zone_overlap = nd_sum(expanded_zone.astype(int), labels=labeled_array, index=indices)
-            has_front_support = zone_overlap > 0
-        else:
-            has_front_support = np.zeros_like(indices, dtype=bool)
-
-        # Cluster ist valide, wenn es eine Basisfront ist ODER frontengestützt:
-        # Nur isolierter Kleinst-Clutter (< 20 Pixel ohne Frontenanschluss) wird gelöscht.
-        is_valid_cluster = is_sure_front | (has_front_support & (cluster_sizes >= 10))
-
-        invalid_cluster_ids = indices[~is_valid_cluster]
-
-        clean_val = val.copy()
-        if len(invalid_cluster_ids) > 0:
-            is_invalid_pixel = np.isin(labeled_array, invalid_cluster_ids)
-            clean_val[is_invalid_pixel] = 0
-
-        return clean_val
-    except ImportError:
-        return val
-
-
-
-def map_radolan_val_to_index(val):
-    """
-    Mappt DWD RADOLAN RV Rohwerte (0.01 mm/5min) auf 256 Turbo-Farbstufen.
-    """
-    idx = np.zeros_like(val, dtype=np.uint8)
-
-    # 1. Zarter Nieselregen & Feuchtesaum (val 2..5 -> 0.24..0.60 mm/h)
-    m1 = (val >= 2) & (val < 6)
-    idx[m1] = (1 + ((val[m1] - 2) / 4.0) * 24).astype(np.uint8)
-
-    # 2. Leichter bis mäßiger Landregen (val 6..20 -> 0.72..2.40 mm/h)
-    m2 = (val >= 6) & (val < 21)
-    idx[m2] = (26 + ((val[m2] - 6) / 15.0) * 64).astype(np.uint8)
-
-    # 3. Kräftiger Schauer (val 21..55 -> 2.52..6.60 mm/h)
-    m3 = (val >= 21) & (val < 56)
-    idx[m3] = (91 + ((val[m3] - 21) / 35.0) * 59).astype(np.uint8)
-
-    # 4. Starkregen (val 56..140 -> 6.72..16.8 mm/h)
-    m4 = (val >= 56) & (val < 141)
-    idx[m4] = (151 + ((val[m4] - 56) / 85.0) * 49).astype(np.uint8)
-
-    # 5. Extremregen (val 141..280 -> 16.9..33.6 mm/h)
-    m5 = (val >= 141) & (val < 281)
-    idx[m5] = (201 + ((val[m5] - 141) / 140.0) * 34).astype(np.uint8)
-
-    # 6. Unwetter / Hagel (val >= 281 -> >33.6 mm/h)
-    m6 = val >= 281
-    idx[m6] = np.clip(236 + (val[m6] - 281) / 5.0, 236, 255).astype(np.uint8)
-
-    return idx
-
-
-def parse_radolan_binary(data_bytes):
-    """
-    Parst ein binäres DWD RADOLAN-Kompositfile (RV, WN, SF, RW).
-    Gibt (header_str, 2D-numpy-array in Roh-Orientierung) zurück.
-    """
-    etx_pos = data_bytes.find(b'\x03')
-    if etx_pos == -1:
-        etx_pos = data_bytes.find(b'\n\x00')
-    if etx_pos == -1:
-        return None, None
-
-    header = data_bytes[:etx_pos].decode('latin1', errors='ignore')
-    raw_data = data_bytes[etx_pos + 1:]
-
-    width = 1100
-    height = 1200
-    if '1200x1100' in header:
-        width, height = 1100, 1200
-    elif '900x900' in header:
-        width, height = 900, 900
-
-    expected_16bit = width * height * 2
-    if len(raw_data) >= expected_16bit:
-        arr = np.frombuffer(raw_data[:expected_16bit], dtype=np.uint16).reshape((height, width))
-        
-        # Maskiere Fehlkennung (Bit 14) und Sensorfehler (Bit 13)
-        is_nodata = (arr & 0x6000) > 0
-        val = arr & 0x0FFF
-        val[is_nodata] = 0
-
-        # Meteorologischer Niesel- & Turm-Zonierungsfilter (val >= 1 bleibt für echte Nieselfelder erhalten)
-        val = remove_isolated_radar_clutter(val)
-
-        # Meteorologisch exakt auf 0..255 LUT mappen
-        grid_indexed = map_radolan_val_to_index(val)
-
-        return header, grid_indexed
-
-    elif len(raw_data) >= width * height:
-        arr = np.frombuffer(raw_data[:width * height], dtype=np.uint8).reshape((height, width))
-        return header, arr
-
-    return None, None
-
-
-def parse_odim_h5(data_bytes):
-    """
-    Parst ein ODIM_H5 Radarkomposit (z.B. composite_rv_*-hd5) mit h5py.
-    Gibt (header_str, 2D-numpy-array in Roh-Orientierung) zurück.
-    """
-    if h5py is None:
-        return None, None
-
-    try:
-        bio = io.BytesIO(data_bytes)
-        with h5py.File(bio, 'r') as h5:
-            if 'dataset1/data1/data' not in h5:
-                return None, None
-            ds = h5['dataset1/data1/data']
-            data_arr = np.array(ds)
-
-            what_grp = h5.get('dataset1/what')
-            gain = float(what_grp.attrs.get('gain', 0.01)) if what_grp else 0.01
-            offset = float(what_grp.attrs.get('offset', 0.0)) if what_grp else 0.0
-            nodata = float(what_grp.attrs.get('nodata', 65535)) if what_grp else 65535
-            undetect = float(what_grp.attrs.get('undetect', 0)) if what_grp else 0
-            quantity = what_grp.attrs.get('quantity', b'ACRR') if what_grp else b'ACRR'
-            if isinstance(quantity, bytes):
-                quantity = quantity.decode('ascii', errors='ignore')
-
-            # ODIM_H5 Orientierung: Row 0 ist Nord (Upper Left).
-            # RADOLAN Binary Orientierung: Row 0 ist Süd (Lower Left).
-            # np.flipud stellt die exakte RADOLAN-Gitterorientierung her (Süd=0, Nord=1199):
-            data_arr = np.flipud(data_arr)
-
-            val = data_arr.astype(np.float32)
-            val[data_arr == nodata] = 0
-            val[data_arr == undetect] = 0
-
-            if quantity == 'ACRR':
-                # ACRR ist 5-Minuten-Akkumulation in mm. RADOLAN RV Integer-Einheit ist 0.01 mm / 5min.
-                val = val * (gain / 0.01) + (offset / 0.01)
-            elif quantity == 'RATE':
-                # RATE ist mm/h. 0.12 mm/h entspricht 1 RADOLAN Einheit.
-                val = (val * gain + offset) / 0.12
-
-            val = np.clip(np.round(val), 0, 4095).astype(np.uint16)
-
-            # Meteorologischer Niesel- & Turmfilter (organischer Frontensaum)
-            val = remove_isolated_radar_clutter(val)
-
-            # Auf Turbo-LUT Farbstufen mappen
-            grid_indexed = map_radolan_val_to_index(val)
-
-            header = f"ODIM_H5 {quantity} {val.shape[0]}x{val.shape[1]}"
-            return header, grid_indexed
-
-    except Exception as e:
-        print(f"⚠️ Hinweis bei ODIM_H5 Parsing: {e}")
-        return None, None
-
-
-def parse_rv_product(data_bytes, filename_hint=""):
-    """
-    Abstrahierte, universelle RV-Parsing-Schnittstelle (Dual-Support mit Fallback):
-    - Parst primär ODIM_H5 (-hd5 / HDF5), falls h5py verfügbar ist und HDF5 vorliegt.
-    - Fällt bei Nichtverfügbarkeit oder Fehlern transparent auf das RADOLAN-Binärformat zurück.
-    """
-    if len(data_bytes) >= 4 and data_bytes[:4] == b'\x89HDF':
-        header, grid = parse_odim_h5(data_bytes)
-        if grid is not None:
-            return header, grid
-
-    # Fallback: Klassischer RADOLAN-Binärparser
-    return parse_radolan_binary(data_bytes)
-
-
-def get_available_dwd_rv_files(prefer_hdf5=True):
-    """
-    Listet alle verfügbaren RADOLAN RV Dateien auf opendata.dwd.de auf.
-    Dual-Support: Wählt primär das moderne ODIM_H5 Format (composite_rv_*.tar),
-    sofern h5py verfügbar ist, mit automatischem Fallback auf RADOLAN Binary (DE1200_RV*.tar.bz2).
-    Gibt (files_list, format_str) zurück: format_str ist 'hdf5' oder 'binary'.
-    """
-    url = "https://opendata.dwd.de/weather/radar/composite/rv/"
-    req = urllib.request.Request(url, headers={'User-Agent': 'localwx-RADOLAN-Engine/2.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode('utf-8')
-        
-        # 1. Prüfe auf ODIM_H5 (composite_rv_YYYYMMDD_HHMM.tar) falls h5py verfügbar ist
-        if prefer_hdf5 and h5py is not None:
-            pattern_h5 = r'href="(composite_rv_(\d{8})_(\d{4})\.tar)"'
-            matches_h5 = re.findall(pattern_h5, html)
-            if matches_h5:
-                files_h5 = []
-                for filename, d_str, t_str in matches_h5:
-                    try:
-                        dt = datetime.strptime(f"{d_str}{t_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                        files_h5.append((filename, dt))
-                    except Exception:
-                        pass
-                if files_h5:
-                    files_h5.sort(key=lambda x: x[1])
-                    return files_h5, "hdf5"
-
-        # 2. Fallback: RADOLAN Binary (DE1200_RVYYMMDDHHMM.tar.bz2)
-        pattern_bin = r'href="(DE1200_RV(\d{10})\.tar\.bz2)"'
-        matches_bin = re.findall(pattern_bin, html)
-        files_bin = []
-        for filename, dt_str in matches_bin:
-            try:
-                dt = datetime.strptime(f"20{dt_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                files_bin.append((filename, dt))
-            except Exception:
-                pass
-        
-        files_bin.sort(key=lambda x: x[1])
-        return files_bin, "binary"
-    except Exception as e:
-        print(f"⚠️ Fehler beim Abrufen des DWD-Index: {e}")
-        return [], "none"
-
-
-def download_and_extract_rv_tar(filename):
-    """
-    Lädt eine RADOLAN RV Archivdatei von DWD OpenData herunter und entpackt sie im Speicher.
-    Unterstützt sowohl HDF5 (.tar) als auch binäre Archive (.tar.bz2).
-    """
-    url = f"https://opendata.dwd.de/weather/radar/composite/rv/{filename}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'localwx-RADOLAN-Engine/2.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            compressed_bytes = resp.read()
-        
-        if filename.endswith('.tar.bz2'):
-            tar_bytes = bz2.decompress(compressed_bytes)
-            tar_stream = io.BytesIO(tar_bytes)
-        else:
-            tar_stream = io.BytesIO(compressed_bytes)
-        
-        extracted_files = {}
-        with tarfile.open(fileobj=tar_stream, mode="r:") as tar:
-            for member in tar.getmembers():
-                if member.isfile():
-                    f = tar.extractfile(member)
-                    if f:
-                        extracted_files[member.name] = f.read()
-        
-        return extracted_files
-    except Exception as e:
-        print(f"⚠️ Fehler beim Laden von {filename}: {e}")
-        return {}
-
-
-# Kompatibilitätsalias
-download_and_extract_tar_bz2 = download_and_extract_rv_tar
-
-
-def render_matrix_to_webp(grid_reprojected_1400, output_path):
-    """
-    Wendet die WarnWetter-Turbo LUT an und speichert als 100% verlustfreies WebP.
-    """
-    rgba = TURBO_LUT[grid_reprojected_1400]
-    
-    # Dünne Rest-Transparenzen unter 10 säubern
-    rgba[rgba[:, :, 3] < 10, 3] = 0
-    
-    img_clean = Image.fromarray(rgba, mode='RGBA')
-    img_clean.save(output_path, 'WEBP', lossless=True, method=6)
-
-
-def apply_temporal_consistency_filter(grid_list):
-    """
-    Bidirektionaler temporaler Konsistenz-Filter (Anti-Flicker, Anti-Pop & Gap-Filling):
-    
-    1. Heilt 'Dips': Wenn ein Regengebiet in t-1 und t+1 existiert, aber in t kurzzeitig unter
-       die Messschwelle sinkt -> interpolieren (verhindert Flackern/Wegploppen).
-    2. Entfernt 'Spikes': Wenn ein schwacher Farbindex (1..25, entspricht Niesel < 0.6 mm/h)
-       nur für exakt 1 Frame isoliert aufblitzt -> löschen.
-    """
-    n = len(grid_list)
-    if n < 3:
-        return grid_list
-
-    try:
-        from scipy.ndimage import maximum_filter
-        cleaned_list = [grid_list[0].copy()]
-
-        for t in range(1, n - 1):
-            prev_g = grid_list[t - 1]
-            curr_g = grid_list[t]
-            next_g = grid_list[t + 1]
-
-            curr_clean = curr_g.copy()
-
-            # 1. Gap-Filling (Dips heilen)
-            is_dip = (curr_clean == 0) & (prev_g > 0) & (next_g > 0)
-            if np.any(is_dip):
-                interpolated = (prev_g[is_dip].astype(np.int32) + next_g[is_dip].astype(np.int32)) // 2
-                curr_clean[is_dip] = np.maximum(1, interpolated).astype(np.uint8)
-
-            # 2. Spike-Removal (Isolierte Flicker-Pixel entfernen)
-            from scipy.ndimage import label as nd_label
-            prev_active = maximum_filter(prev_g > 0, size=11)
-            next_active = maximum_filter(next_g > 0, size=11)
-            temporal_support = prev_active | next_active
-
-            # Indizes 1..25 entsprechen Niesel/Feuchtesaum (< 0.6 mm/h)
-            potential_spikes = (curr_clean > 0) & (curr_clean <= 25) & (~temporal_support)
-            if np.any(potential_spikes):
-                sp_labeled, sp_num = nd_label(potential_spikes, structure=np.ones((3, 3), dtype=bool))
-                if sp_num > 0:
-                    sp_idx = np.arange(1, sp_num + 1)
-                    from scipy.ndimage import sum as sp_sum
-                    sp_sizes = sp_sum(np.ones_like(potential_spikes), labels=sp_labeled, index=sp_idx)
-                    # Nur echte Spikes (< 20 Pixel) entfernen, großflächige Nieselfronten erhalten!
-                    true_spikes = sp_idx[sp_sizes < 20]
-                    if len(true_spikes) > 0:
-                        is_true_spike = np.isin(sp_labeled, true_spikes)
-                        curr_clean[is_true_spike] = 0
-
-            cleaned_list.append(curr_clean)
-
-        # Letzter Frame: Einseitige Prüfung gegen t-1
-        last_g = grid_list[-1]
-        prev_active = maximum_filter(grid_list[-2] > 0, size=11)
-        potential_last_spikes = (last_g > 0) & (last_g <= 25) & (~prev_active)
-        last_clean = last_g.copy()
-        if np.any(potential_last_spikes):
-            from scipy.ndimage import label as nd_label, sum as sp_sum
-            sp_labeled, sp_num = nd_label(potential_last_spikes, structure=np.ones((3, 3), dtype=bool))
-            if sp_num > 0:
-                sp_idx = np.arange(1, sp_num + 1)
-                sp_sizes = sp_sum(np.ones_like(potential_last_spikes), labels=sp_labeled, index=sp_idx)
-                true_last_spikes = sp_idx[sp_sizes < 20]
-                if len(true_last_spikes) > 0:
-                    last_clean[np.isin(sp_labeled, true_last_spikes)] = 0
-        cleaned_list.append(last_clean)
-
-        return cleaned_list
-    except Exception as e:
-        print(f"Hinweis beim Temporal-Filter: {e}")
-        return grid_list
-
-
-def snap_cell_to_surface_radar(lat_aloft, lon_aloft, surface_grid, search_radius_km=35):
-    """
-    Intelligentes Boden-Snapping:
-    Sucht im Umkreis von bis zu 35 km um den 3D-Höhenschwerpunkt der Gewitterzelle
-    nach dem tatsächlichen Starkregen-/Reflektivitätskern am Boden im RADOLAN-Raster.
-    Gibt (lat_ground, lon_ground, d_lat, d_lon) zurück.
-    """
-    if surface_grid is None:
-        return lat_aloft, lon_aloft, 0.0, 0.0
-
-    try:
-        R = 6370.040
-        lat_ts = np.radians(60.0)
-        lon_0 = np.radians(10.0)
-        scale = R * (1.0 + np.sin(lat_ts))
-
-        phi = np.radians(lat_aloft)
-        lam = np.radians(lon_aloft)
-        m = scale / (1.0 + np.sin(phi))
-        xp = m * np.cos(phi) * np.sin(lam - lon_0)
-        yp = -m * np.cos(phi) * np.cos(lam - lon_0)
-
-        cx = int(round(xp + 543.462))
-        cy = int(round(yp + 4808.645))
-
-        h, w = surface_grid.shape
-        r_px = int(round(search_radius_km))
-        xmin = max(0, cx - r_px)
-        xmax = min(w - 1, cx + r_px)
-        ymin = max(0, cy - r_px)
-        ymax = min(h - 1, cy + r_px)
-
-        window = surface_grid[ymin:ymax+1, xmin:xmax+1]
-        max_val = np.max(window) if window.size > 0 else 0
-
-        # Nur snappen, wenn im Umkreis tatsächlich ein relevanter Niederschlagskern (>= 15) existiert
-        if max_val >= 15:
-            # Fokus auf den echten Peak-Kern (>= 82% des Maximums) mit quadratischer Gewichtung
-            threshold = max(15, int(0.82 * max_val))
-            mask = window >= threshold
-            y_indices, x_indices = np.where(mask)
-            weights = np.power(window[mask].astype(np.float64) - threshold + 1.0, 2.0)
-            
-            if np.sum(weights) > 0:
-                x_ground = np.sum(x_indices * weights) / np.sum(weights) + xmin
-                y_ground = np.sum(y_indices * weights) / np.sum(weights) + ymin
-
-                # Rückprojektion auf WGS84
-                xp_g = x_ground - 543.462
-                yp_g = y_ground - 4808.645
-                d = np.sqrt(xp_g * xp_g + yp_g * yp_g)
-                phi_g = np.pi / 2.0 - 2.0 * np.arctan(d / scale)
-                lam_g = lon_0 + np.arctan2(xp_g, -yp_g)
-                
-                lat_ground = np.degrees(phi_g)
-                lon_ground = np.degrees(lam_g)
-
-                d_lat = lat_ground - lat_aloft
-                d_lon = lon_ground - lon_aloft
-                
-                dist_km = np.sqrt(((d_lat * 111.32) ** 2) + ((d_lon * 111.32 * np.cos(np.radians(lat_aloft))) ** 2))
-                if dist_km <= 40.0:
-                    return lat_ground, lon_ground, d_lat, d_lon
-    except Exception as e:
-        print(f"Hinweis beim Boden-Snapping: {e}")
-
-    return lat_aloft, lon_aloft, 0.0, 0.0
-
-
-def fetch_and_parse_konrad3d(output_dir, surface_grid=None):
-    """
-    Lädt das neueste DWD KONRAD3D (3D-Zelltracking) XML von opendata.dwd.de herunter
-    und erzeugt ein optimiertes cells.json mit allen aktiven Gewitterzellen,
-    Zugbahnen, Hagel-Flags, dBZ-Werten und Geschwindigkeiten.
-    Wendet intelligentes Boden-Snapping auf das sichtbare RADOLAN-Bodenradar an.
-    """
-    print("⚡ Rufe aktuelle DWD KONRAD3D Gewitter- & Hagelzell-Daten ab...")
-    cells_data = {
-        "reference_time": None,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "total_cells": 0,
-        "cells": []
-    }
-    
-    try:
-        url = "https://opendata.dwd.de/weather/radar/konrad3d/"
-        req = urllib.request.Request(url, headers={'User-Agent': 'localwx-Radar/2.0'})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-        
-        files = re.findall(r'href="(KONRAD3D_[^"]+\.xml)"', html)
-        if not files:
-            print("ℹ️ Keine KONRAD3D-Dateien auf opendata.dwd.de gefunden.")
-            with open(os.path.join(output_dir, "cells.json"), 'w', encoding='utf-8') as f:
-                json.dump(cells_data, f, indent=2, ensure_ascii=False)
-            return cells_data
-
-        latest_file = sorted(files)[-1]
-        print(f"🌩️ Lade neueste KONRAD3D-Datei: {latest_file}...")
-        
-        file_url = f"https://opendata.dwd.de/weather/radar/konrad3d/{latest_file}"
-        with urllib.request.urlopen(file_url, timeout=15) as resp:
-            xml_bytes = resp.read()
-
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(xml_bytes)
-        
-        ref_time_elem = root.find('.//metadata/reference_time')
-        ref_time = ref_time_elem.text if ref_time_elem is not None else datetime.now(timezone.utc).isoformat()
-        cells_data["reference_time"] = ref_time
-
-        parsed_cells = []
-        for feat in root.findall('.//feature'):
-            feat_id = feat.attrib.get('identifier', str(len(parsed_cells) + 1))
-            
-            # 1. Centroid (Schwerpunkt)
-            centroid = feat.find('.//centroid_3d/geodetic_coordinate')
-            if centroid is None:
-                continue
-            lat_elem = centroid.find('latitude')
-            lon_elem = centroid.find('longitude')
-            if lat_elem is None or lon_elem is None:
-                continue
-            lat = round(float(lat_elem.text), 5)
-            lon = round(float(lon_elem.text), 5)
-            
-            height_elem = centroid.find('height_msl')
-            height_m = round(float(height_elem.text), 0) if height_elem is not None else 0
-            
-            # 2. Motion & Velocity
-            motion = feat.find('.//motion')
-            speed = 0.0
-            direction = 0.0
-            if motion is not None:
-                sp_elem = motion.find('.//speed')
-                if sp_elem is not None and sp_elem.text:
-                    try:
-                        speed = round(float(sp_elem.text), 1)
-                    except ValueError:
-                        pass
-                dir_elem = motion.find('.//direction')
-                if dir_elem is not None and dir_elem.text:
-                    try:
-                        direction = round(float(dir_elem.text), 0)
-                    except ValueError:
-                        pass
-            
-            if speed == 0.0:
-                cs_elem = feat.find('.//cell_speed')
-                if cs_elem is not None and cs_elem.text:
-                    try:
-                        speed = round(float(cs_elem.text), 1)
-                    except ValueError:
-                        pass
-
-            # 3. Intensity, Reflectivity & Hazards
-            intensity = feat.find('.//intensity')
-            max_dbz = 0.0
-            severity = 0
-            hail_flag = 0
-            heavy_rain_flag = 0
-            gust_speed = 0.0
-            
-            if intensity is not None:
-                dbz_elem = intensity.find('max_value')
-                if dbz_elem is not None and dbz_elem.text:
-                    try:
-                        max_dbz = round(float(dbz_elem.text), 1)
-                    except ValueError:
-                        pass
-                
-                sev_elem = intensity.find('severity')
-                if sev_elem is not None and sev_elem.text:
-                    try:
-                        severity = int(sev_elem.text)
-                    except ValueError:
-                        pass
-                
-                hf_elem = intensity.find('hail_flag')
-                if hf_elem is not None and hf_elem.text:
-                    try:
-                        hail_flag = int(hf_elem.text)
-                    except ValueError:
-                        pass
-                        
-                hrf_elem = intensity.find('heavy_rain_flag')
-                if hrf_elem is not None and hrf_elem.text:
-                    try:
-                        heavy_rain_flag = int(hrf_elem.text)
-                    except ValueError:
-                        pass
-                        
-                gust_elem = intensity.find('maximum_estimated_wind_gust')
-                if gust_elem is not None and gust_elem.text:
-                    try:
-                        gust_speed = round(float(gust_elem.text), 1)
-                    except ValueError:
-                        pass
-
-            # 4. Lightning & Mesocyclone
-            lightning_rate = 0
-            lt_elem = feat.find('.//lightning/lightning_rate')
-            if lt_elem is not None and lt_elem.text:
-                try:
-                    lightning_rate = int(round(float(lt_elem.text)))
-                except ValueError:
-                    pass
-
-            is_mesocyclone = False
-            meso_elem = feat.find('.//mesocyclone/mesocyclone_severity_index')
-            if meso_elem is not None and meso_elem.text:
-                try:
-                    is_mesocyclone = int(meso_elem.text) > 0
-                except ValueError:
-                    pass
-
-            # 5. Geodetic Polygon
-            polygon_coords = []
-            poly = feat.find('.//polygons_projected/geodetic_coordinates/polygon')
-            if poly is not None:
-                lats_elem = poly.find('latitudes')
-                lons_elem = poly.find('longitudes')
-                if lats_elem is not None and lons_elem is not None and lats_elem.text and lons_elem.text:
-                    try:
-                        lats_list = [round(float(x), 5) for x in lats_elem.text.strip().split()]
-                        lons_list = [round(float(x), 5) for x in lons_elem.text.strip().split()]
-                        polygon_coords = [[lt, ln] for lt, ln in zip(lats_list, lons_list)]
-                    except Exception:
-                        pass
-
-            # 6. Future Track Forecast (+5m bis +60m direkt aus DWD centroid_forecast)
-            forecast_track = []
-            for fc_elem in feat.findall('.//centroid_forecast'):
-                fc_lat = fc_elem.find('.//latitude')
-                fc_lon = fc_elem.find('.//longitude')
-                
-                fc_time_str = fc_elem.attrib.get('forecast_time', '')
-                lead_time_min = 0
-                if fc_time_str and ref_time:
-                    try:
-                        t_ref = datetime.fromisoformat(ref_time.replace('Z', '+00:00'))
-                        t_fc = datetime.fromisoformat(fc_time_str.replace('Z', '+00:00'))
-                        lead_time_min = int(round((t_fc - t_ref).total_seconds() / 60.0))
-                    except Exception:
-                        lead_time_min = (len(forecast_track) + 1) * 5
-                else:
-                    lead_time_min = (len(forecast_track) + 1) * 5
-
-                if fc_lat is not None and fc_lon is not None and fc_lat.text and fc_lon.text:
-                    try:
-                        forecast_track.append({
-                            "lead_time_min": lead_time_min,
-                            "lat": round(float(fc_lat.text), 5),
-                            "lon": round(float(fc_lon.text), 5)
-                        })
-                    except ValueError:
-                        pass
-
-            # Berechne echte Zugrichtung & Geschwindigkeit aus dem ersten Vektorpunkt falls nicht explizit gegeben
-            if forecast_track:
-                first_pt = forecast_track[0]
-                d_lat = first_pt["lat"] - lat
-                d_lon = (first_pt["lon"] - lon) * np.cos(np.radians(lat))
-                angle_deg = np.degrees(np.arctan2(d_lon, d_lat))
-                if direction == 0:
-                    direction = round((angle_deg + 360) % 360, 0)
-                if speed == 0 and first_pt["lead_time_min"] > 0:
-                    dist_km = np.sqrt((d_lat * 111.32)**2 + (d_lon * 111.32)**2)
-                    speed = round(dist_km / (first_pt["lead_time_min"] / 60.0), 1)
-            elif speed > 0:
-                eff_dir = direction if direction > 0 else 65.0
-                rad_dir = np.radians(eff_dir)
-                for step_min in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]:
-                    dist_km = (speed * (step_min / 60.0))
-                    d_lat_step = (dist_km * np.cos(rad_dir)) / 111.32
-                    d_lon_step = (dist_km * np.sin(rad_dir)) / (111.32 * np.cos(np.radians(lat)))
-                    forecast_track.append({
-                        "lead_time_min": step_min,
-                        "lat": round(lat + d_lat_step, 5),
-                        "lon": round(lon + d_lon_step, 5)
-                    })
-
-            # 7. Boden-Snapping: Zentriere Marker, Polygon & Zugbahn auf den tatsächlichen Boden-Radarkern
-            lat_ground, lon_ground, d_lat, d_lon = snap_cell_to_surface_radar(lat, lon, surface_grid)
-            if abs(d_lat) > 0.0001 or abs(d_lon) > 0.0001:
-                dist_corr = np.sqrt(((d_lat * 111.32) ** 2) + ((d_lon * 111.32 * np.cos(np.radians(lat))) ** 2))
-                print(f"🎯 Boden-Snapping Zelle #{feat_id}: Versatz {dist_corr:.1f} km korrigiert -> Boden-Position: Lat={lat_ground:.5f}, Lon={lon_ground:.5f}")
-                lat = round(lat_ground, 5)
-                lon = round(lon_ground, 5)
-                if polygon_coords:
-                    polygon_coords = [[round(p[0] + d_lat, 5), round(p[1] + d_lon, 5)] for p in polygon_coords]
-                if forecast_track:
-                    forecast_track = [{**pt, "lat": round(pt["lat"] + d_lat, 5), "lon": round(pt["lon"] + d_lon, 5)} for pt in forecast_track]
-
-            # Farb- & Gefahrenklassifikation
-            level = "moderate"
-            level_name = "Mäßiges Gewitter"
-            color = "#f59e0b"
-            
-            if is_mesocyclone or max_dbz >= 65:
-                level = "extreme"
-                level_name = "Extremes Unwetter / Superzelle"
-                color = "#d946ef"
-            elif hail_flag or max_dbz >= 55 or gust_speed >= 75:
-                level = "severe"
-                level_name = "Schweres Gewitter / Hagel"
-                color = "#ef4444"
-            elif max_dbz >= 45 or heavy_rain_flag:
-                level = "strong"
-                level_name = "Kräftiges Gewitter"
-                color = "#f97316"
-
-            parsed_cells.append({
-                "id": feat_id,
-                "reference_time": ref_time,
-                "lat": lat,
-                "lon": lon,
-                "height_m": height_m,
-                "level": level,
-                "level_name": level_name,
-                "color": color,
-                "max_dbz": max_dbz,
-                "severity": severity,
-                "is_hail": bool(hail_flag),
-                "is_heavy_rain": bool(heavy_rain_flag),
-                "is_mesocyclone": is_mesocyclone,
-                "max_gust_kmh": gust_speed,
-                "speed_kmh": speed,
-                "direction_deg": direction,
-                "lightning_rate": lightning_rate,
-                "polygon": polygon_coords,
-                "forecast_track": forecast_track
-            })
-
-        cells_data["total_cells"] = len(parsed_cells)
-        cells_data["cells"] = parsed_cells
-        print(f"✅ {len(parsed_cells)} aktive Gewitterzellen erfolgreich aus KONRAD3D geparst.")
-
-    except Exception as e:
-        print(f"⚠️ Hinweis bei KONRAD3D Parsing: {e}")
-
-    cells_path = os.path.join(output_dir, "cells.json")
-    with open(cells_path, 'w', encoding='utf-8') as f:
-        json.dump(cells_data, f, indent=2, ensure_ascii=False)
-
-    return cells_data
-
-
-def generate_radar_dataset():
-    start_time = time.time()
-    print("🚀 Starte DWD RADOLAN HD 5-Minuten Turbo-Radar Generator (100% DWD OpenData)...")
-
-    output_dir = "./dist/radar"
-    os.makedirs(output_dir, exist_ok=True)
-
-    dwd_files, rv_format = get_available_dwd_rv_files(prefer_hdf5=True)
-    if not dwd_files:
-        print("❌ Keine RADOLAN-Dateien auf opendata.dwd.de gefunden!")
-        return
-
-    now = datetime.now(timezone.utc)
-    print(f"📡 DWD OpenData Server erreichbar ({len(dwd_files)} {rv_format.upper()}-Komposite verfügbar).")
-
-    # Letzte 8 Stunden Historie
-    eight_hours_ago = now - timedelta(hours=8)
-    selected_history = [f for f in dwd_files if f[1] >= eight_hours_ago and f[1] <= now]
-
-    print(f"📦 Lade {len(selected_history)} lückenlose 5-Minuten-Messungen (-8h bis Jetzt)...")
-
-    raw_history_items = []
-
-    def process_history_item(item, idx):
-        filename, valid_dt = item
-        data_dict = download_and_extract_rv_tar(filename)
-        if not data_dict:
-            return None
-
-        main_key = next((k for k in sorted(data_dict.keys()) if re.search(r'_000(?:-hd5)?$', k)), None)
-        if not main_key:
-            main_key = sorted(data_dict.keys())[0]
-
-        file_bytes = data_dict[main_key]
-        header, grid = parse_rv_product(file_bytes, filename_hint=main_key)
-        if grid is None:
-            return None
-
-        return {
-            "valid_dt": valid_dt,
-            "grid": grid,
-            "is_nowcast": False
-        }
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(process_history_item, item, i): i for i, item in enumerate(selected_history)}
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                raw_history_items.append(res)
-
-    raw_history_items.sort(key=lambda x: x['valid_dt'])
-    print(f"✅ {len(raw_history_items)} historische 5-Minuten-Grids geladen.")
-
-    # Nowcast (+2h)
-    raw_nowcast_items = []
-    latest_file = dwd_files[-1][0]
-    latest_dt = dwd_files[-1][1]
-    print(f"🔮 Lade DWD 5-Minuten Nowcast (+2h) aus neuester Datei: {latest_file}...")
-
-    nowcast_data = download_and_extract_rv_tar(latest_file)
-    if nowcast_data:
-        nowcast_keys = [k for k in sorted(nowcast_data.keys()) if not re.search(r'_000(?:-hd5)?$', k)]
-        selected_nowcast_keys = []
-        for k in nowcast_keys:
-            m = re.search(r'_(\d{3})(?:-hd5)?$', k)
-            if m:
-                minutes = int(m.group(1))
-                selected_nowcast_keys.append((k, minutes))
-        
-        selected_nowcast_keys.sort(key=lambda x: x[1])
-
-        for k, minutes in selected_nowcast_keys:
-            file_bytes = nowcast_data[k]
-            header, grid = parse_rv_product(file_bytes, filename_hint=k)
-            if grid is not None:
-                valid_dt = latest_dt + timedelta(minutes=minutes)
-                raw_nowcast_items.append({
-                    "valid_dt": valid_dt,
-                    "grid": grid,
-                    "is_nowcast": True
-                })
-
-    all_items = raw_history_items + raw_nowcast_items
-    all_items.sort(key=lambda x: x['valid_dt'])
-    print(f"🧠 Wende 3-Stufen Temporal & Spatial Anti-Pop Filter auf alle {len(all_items)} Frames an...")
-
-    # 1. Temporal Consistency Filter auf raw radar grids
-    raw_grids = [item['grid'] for item in all_items]
-    cleaned_grids = apply_temporal_consistency_filter(raw_grids)
-
-    print(f"🌐 Führe Polar-Stereographische Reprojektion & Isolinien-Glättung durch...")
-
-    # 2. Paralleles Reprojizieren und Rendern
-    frames_metadata = []
-
-    def render_and_save(idx):
-        item = all_items[idx]
-        grid = cleaned_grids[idx]
-        
-        # Exakte Reprojektion von Polar-Stereo auf WGS84 + Konturglättung
-        warped_grid = reproject_and_smooth_radar(grid)
-        
-        file_name = f"radar_{idx:03d}.webp"
-        file_path = os.path.join(output_dir, file_name)
-        render_matrix_to_webp(warped_grid, file_path)
-
-        return {
-            "step": idx,
-            "valid_time": item['valid_dt'].strftime("%Y-%m-%dT%H:%M:00Z"),
-            "file": file_name,
-            "is_nowcast": item['is_nowcast']
-        }
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(render_and_save, i): i for i in range(len(all_items))}
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                frames_metadata.append(res)
-
-    frames_metadata.sort(key=lambda x: x['step'])
-    print(f"✨ Gesamt-Datensatz: {len(frames_metadata)} flüssige 5-Minuten-Frames fertig gerendert!")
-
-    # 3. DWD KONRAD3D Gewitter-Zelltracking abrufen (mit Boden-Snapping auf das neueste Boden-Radar)
-    latest_surface_grid = raw_history_items[-1]['grid'] if raw_history_items else (cleaned_grids[-1] if cleaned_grids else None)
-    cells_result = fetch_and_parse_konrad3d(output_dir, surface_grid=latest_surface_grid)
-
-    metadata = {
-        "model": "DWD RADOLAN HD",
-        "parameter": "precipitation_radar",
-        "title": "DWD RADOLAN HD Doppler-Radar (-8h bis +2h, 5-Minuten-Takt)",
-        "unit": "mm/h",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "bounds": RADAR_BOUNDS,
-        "cells_file": "cells.json",
-        "cells_count": cells_result.get("total_cells", 0),
-        "frames": frames_metadata
-    }
-
-    meta_path = os.path.join(output_dir, "meta.json")
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
-
-    duration = round(time.time() - start_time, 1)
-    print(f"🎉 Radar- & KONRAD3D-Generierung in {duration}s abgeschlossen!")
-
-    upload_directory_to_ftp(output_dir, "radar")
-
-
-def upload_directory_to_ftp(local_dir, remote_folder="radar"):
-    server = os.environ.get('FTP_SERVER')
-    user = os.environ.get('FTP_USERNAME')
-    password = os.environ.get('FTP_PASSWORD')
-
-    if not server or not user or not password:
-        print(f"ℹ️ Keine FTP-Zugangsdaten. Überspringe Upload für {remote_folder}.")
-        return
-
-    print(f"\n📡 Verbinde mit FTP-Server für 'data/{remote_folder}/'...")
-
-    ftp = None
-    try:
-        ftp = ftplib.FTP_TLS()
-        ftp.connect(server, 21, timeout=30)
-        ftp.login(user, password)
-        ftp.prot_p()
-    except Exception:
-        try:
-            ftp = ftplib.FTP()
-            ftp.connect(server, 21, timeout=30)
-            ftp.login(user, password)
-        except Exception as e:
-            print(f"❌ FTP-Verbindung fehlgeschlagen: {e}")
-            return
-
-    ftp.cwd('/')
-    for folder in ["data", remote_folder]:
-        try:
-            ftp.cwd(folder)
-        except ftplib.error_perm:
-            try:
-                ftp.mkd(folder)
-                ftp.cwd(folder)
-            except Exception as e:
-                print(f"Hinweis beim Ordnererstellen ({folder}): {e}")
-
-    files = [f for f in os.listdir(local_dir) if f.endswith('.webp') or f.endswith('.json')]
-    print(f"📤 Lade {len(files)} Radar-Dateien nach data/{remote_folder}/ hoch...")
-
-    uploaded_count = 0
-    for filename in sorted(files):
-        local_path = os.path.join(local_dir, filename)
-        with open(local_path, 'rb') as f_in:
-            ftp.storbinary(f"STOR {filename}", f_in)
-            uploaded_count += 1
-
-    ftp.quit()
-    print(f"✅ {uploaded_count} Radar-Dateien erfolgreich nach data/{remote_folder}/ hochgeladen!")
-
-
-if __name__ == "__main__":
-    generate_radar_dataset()
+        idx = np.arange(1, num_features + 1)
+        sizes = nd_sum(np.ones_like(val), labels=labeled, index=idx)
+        maxs = nd_max(val, labels=labeled, index=idx)
+
+        # Unmittelbarer 6-km-Antennenbereich
+        tower_mask_6km = get_radar_tower_zone_mask(val.shape[0], val.shape[1], radius_km=6)
+        touches_tower = nd_sum(tower_mask_6km.astype(int), labels=labeled, index=idx) > 0
+
+        # 1. Sichere echte Regengebiete / Nieselfelder:
+        # - Jedes zusammenhängende Gebiet >= 35 Pixel (
