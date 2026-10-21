@@ -152,23 +152,25 @@ WXCHARTS_TEMP_COLORS = [
 ]
 WXCHARTS_TEMP_LEVELS = np.arange(-40, 42, 2)
 WXCHARTS_TEMP_CMAP = mcolors.ListedColormap(WXCHARTS_TEMP_COLORS, name='wxcharts_temp')
-WXCHARTS_TEMP_NORM = mcolors.BoundaryNorm(WXCHARTS_TEMP_LEVELS, len(WXCHARTS_TEMP_COLORS))
+WXCHARTS_TEMP_CMAP.set_under(WXCHARTS_TEMP_COLORS[0])
+WXCHARTS_TEMP_CMAP.set_over(WXCHARTS_TEMP_COLORS[-1])
 
 
-# WXCHARTS 500 hPa Geopotentialhöhe (gpdm) Farbskala
+# WXCHARTS 500 hPa Geopotentialhöhe (gpdm) Farbskala (24 Stufen)
 WXCHARTS_Z500_COLORS = [
-    '#4a044e', '#6b116d', '#86198f', '#a21caf', '#c026d3',  # 492 - 512 (Polartiefs)
-    '#1e3a8a', '#1d4ed8', '#2563eb', '#0284c7', '#0ea5e9',  # 512 - 532 (Tröge)
-    '#059669', '#10b981', '#34d399', '#6ee7b7',              # 532 - 548 (Übergang)
-    '#84cc16', '#a3e635', '#eab308', '#f59e0b', '#f97316',  # 548 - 568 (Keile / Rücken)
-    '#ef4444', '#dc2626', '#b91c1c', '#991b1b', '#701a75'   # 568 - 592 (Subtropenhochs)
+    '#4a044e', '#6b116d', '#86198f', '#a21caf', '#c026d3',  # 496 - 516 (Polartiefs)
+    '#1e3a8a', '#1d4ed8', '#2563eb', '#0284c7', '#0ea5e9',  # 516 - 536 (Tröge)
+    '#059669', '#10b981', '#34d399', '#6ee7b7',              # 536 - 552 (Übergang)
+    '#84cc16', '#a3e635', '#eab308', '#f59e0b', '#f97316',  # 552 - 572 (Keile / Rücken)
+    '#ef4444', '#dc2626', '#b91c1c', '#991b1b', '#701a75'   # 572 - 592 (Subtropenhochs)
 ]
-WXCHARTS_Z500_LEVELS = np.arange(492, 596, 4)
+WXCHARTS_Z500_LEVELS = np.arange(496, 596, 4)
 WXCHARTS_Z500_CMAP = mcolors.ListedColormap(WXCHARTS_Z500_COLORS, name='wxcharts_z500')
-WXCHARTS_Z500_NORM = mcolors.BoundaryNorm(WXCHARTS_Z500_LEVELS, len(WXCHARTS_Z500_COLORS))
+WXCHARTS_Z500_CMAP.set_under(WXCHARTS_Z500_COLORS[0])
+WXCHARTS_Z500_CMAP.set_over(WXCHARTS_Z500_COLORS[-1])
 
 
-# WXCHARTS 300 hPa Jetstream Windgeschwindigkeit (km/h)
+# WXCHARTS 300 hPa Jetstream Windgeschwindigkeit (km/h) (11 Stufen)
 WXCHARTS_JET_COLORS = [
     '#0f172a',  # 40 - 70 (Hintergrund / schwacher Wind)
     '#083344',  # 70 - 100
@@ -180,11 +182,12 @@ WXCHARTS_JET_COLORS = [
     '#dc2626',  # 250 - 280 (Rot)
     '#c026d3',  # 280 - 310 (Magenta)
     '#f472b6',  # 310 - 340 (Rosa)
-    '#ffffff',  # > 340 (Extremer Kernjet)
+    '#ffffff',  # 340 - 370 (Extremer Kernjet)
 ]
-WXCHARTS_JET_LEVELS = np.arange(40, 370, 30)
+WXCHARTS_JET_LEVELS = np.arange(40, 400, 30)
 WXCHARTS_JET_CMAP = mcolors.ListedColormap(WXCHARTS_JET_COLORS, name='wxcharts_jet')
-WXCHARTS_JET_NORM = mcolors.BoundaryNorm(WXCHARTS_JET_LEVELS, len(WXCHARTS_JET_COLORS))
+WXCHARTS_JET_CMAP.set_under(WXCHARTS_JET_COLORS[0])
+WXCHARTS_JET_CMAP.set_over(WXCHARTS_JET_COLORS[-1])
 
 
 # ==============================================================================
@@ -407,7 +410,7 @@ def render_step_task(task_args):
             contour_val = data['pmsl']  # WXCHARTS Standard: 850 hPa Temp MIT Bodendruck-Isobaren!
             title_str = "850 hPa Temperatur (°C) & Bodendruck (hPa)"
             unit_str = "°C"
-            cmap, norm, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_NORM, WXCHARTS_TEMP_LEVELS
+            cmap, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_LEVELS
             contour_levels = np.arange(960, 1052, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(-40, 44, 4)
@@ -418,7 +421,7 @@ def render_step_task(task_args):
             contour_val = data['pmsl']
             title_str = "500 hPa Geopotentialhöhe (gpdm) & Bodendruck (hPa)"
             unit_str = "gpdm"
-            cmap, norm, levels = WXCHARTS_Z500_CMAP, WXCHARTS_Z500_NORM, WXCHARTS_Z500_LEVELS
+            cmap, levels = WXCHARTS_Z500_CMAP, WXCHARTS_Z500_LEVELS
             contour_levels = np.arange(960, 1052, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(496, 596, 8)
@@ -429,7 +432,7 @@ def render_step_task(task_args):
             contour_val = data['fi300']
             title_str = "300 hPa Wind & Jetstream (km/h) & 300 hPa Isohypsen"
             unit_str = "km/h"
-            cmap, norm, levels = WXCHARTS_JET_CMAP, WXCHARTS_JET_NORM, WXCHARTS_JET_LEVELS
+            cmap, levels = WXCHARTS_JET_CMAP, WXCHARTS_JET_LEVELS
             contour_levels = np.arange(840, 988, 8)
             contour_fmt = "%d"
             cbar_ticks = np.arange(40, 370, 30)
@@ -440,7 +443,7 @@ def render_step_task(task_args):
             contour_val = data['pmsl']
             title_str = "2m Temperatur (°C) & Bodendruck (hPa)"
             unit_str = "°C"
-            cmap, norm, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_NORM, WXCHARTS_TEMP_LEVELS
+            cmap, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_LEVELS
             contour_levels = np.arange(960, 1052, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(-40, 44, 4)
@@ -470,7 +473,7 @@ def render_step_task(task_args):
                 # 2. Ausgefüllte meteorologische Farbfelder (zorder=2)
                 cf = ax.contourf(
                     lon_mesh, lat_mesh, field_val,
-                    levels=levels, cmap=cmap, norm=norm,
+                    levels=levels, cmap=cmap,
                     extend='both', transform=ccrs.PlateCarree(),
                     zorder=2
                 )
@@ -540,7 +543,7 @@ def render_step_task(task_args):
             else:
                 # Fallback ohne Cartopy
                 ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], facecolor='#0b0f19')
-                cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, norm=norm, extend='both')
+                cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=levels, cmap=cmap, extend='both')
                 if contour_val is not None:
                     cs = ax.contour(lon_mesh, lat_mesh, contour_val, levels=contour_levels, colors='#ffffff', linewidths=1.1)
                     ax.clabel(cs, inline=True, fmt=contour_fmt, fontsize=9, colors='#ffffff')
