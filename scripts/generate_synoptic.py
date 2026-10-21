@@ -82,6 +82,7 @@ def setup_cartopy_offline():
     downloads = [
         ("https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_coastline.zip", target_dir, "ne_50m_coastline.shp"),
         ("https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_0_boundary_lines_land.zip", target_cultural, "ne_50m_admin_0_boundary_lines_land.shp"),
+        ("https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_1_states_provinces_lines.zip", target_cultural, "ne_50m_admin_1_states_provinces_lines.shp"),
         ("https://naturalearth.s3.amazonaws.com/50m_physical/ne_50m_lakes.zip", target_dir, "ne_50m_lakes.shp")
     ]
 
@@ -478,22 +479,48 @@ def render_step_task(task_args):
                     zorder=2
                 )
 
-                # 3. Küstenlinien und Ländergrenzen im WXCharts-Stil (zorder=4)
+                # 3. Küstenlinien, Grenzen und Bundesländer im WXCharts-Stil (zorder=4)
                 try:
+                    # Seen (Bodensee, Müritz, Genfersee etc.)
+                    ax.add_feature(
+                        cfeature.LAKES.with_scale('50m'),
+                        edgecolor='#0f172a', facecolor='none', linewidth=0.8, zorder=4
+                    )
+                    # Bundesländer / Provinzen (dezent gestrichelt für sofortige Orientierung in Deutschland)
+                    states_provinces = cfeature.NaturalEarthFeature(
+                        category='cultural',
+                        name='admin_1_states_provinces_lines',
+                        scale='50m',
+                        facecolor='none'
+                    )
+                    ax.add_feature(
+                        states_provinces,
+                        edgecolor='#0f172a',
+                        linewidth=0.8,
+                        linestyle='--',
+                        alpha=0.65,
+                        zorder=4
+                    )
+                    # Küstenlinien (Doppel-Kontur für maximale Sichtbarkeit auf jedem Farbuntergrund)
                     ax.add_feature(
                         cfeature.COASTLINE.with_scale('50m'),
-                        edgecolor='#0f172a', linewidth=1.0, zorder=4
+                        edgecolor='#ffffff', linewidth=2.4, alpha=0.40, zorder=4
+                    )
+                    ax.add_feature(
+                        cfeature.COASTLINE.with_scale('50m'),
+                        edgecolor='#000000', linewidth=1.4, zorder=4
+                    )
+                    # Nationale Außengrenzen (Ländergrenzen) - DEUTLICH, durchgezogen mit Halo
+                    ax.add_feature(
+                        cfeature.BORDERS.with_scale('50m'),
+                        edgecolor='#ffffff', linewidth=3.2, alpha=0.55, linestyle='-', zorder=4
                     )
                     ax.add_feature(
                         cfeature.BORDERS.with_scale('50m'),
-                        edgecolor='#334155', linewidth=0.6, linestyle=':', zorder=4
-                    )
-                    ax.add_feature(
-                        cfeature.LAKES.with_scale('50m'),
-                        edgecolor='#0f172a', facecolor='none', linewidth=0.6, zorder=4
+                        edgecolor='#000000', linewidth=1.7, linestyle='-', zorder=4
                     )
                 except Exception:
-                    ax.coastlines(resolution='110m', color='#0f172a', linewidth=0.9, zorder=4)
+                    ax.coastlines(resolution='110m', color='#000000', linewidth=1.5, zorder=4)
 
                 # 4. Weiße Isobaren / Isohypsen mit schwarzem Text-Halo (zorder=5)
                 if contour_val is not None:
@@ -595,17 +622,23 @@ def render_step_task(task_args):
             # ==================================================================
             # Hintergrundleiste für die Legende
             cbar_bg = fig.add_axes([0.02, 0.015, 0.96, 0.045], facecolor='#0b0f19')
-            cbar_bg.patch.set_alpha(0.85)
+            cbar_bg.patch.set_alpha(0.88)
             cbar_bg.patch.set_edgecolor('#334155')
             cbar_bg.patch.set_linewidth(0.8)
             cbar_bg.set_xticks([])
             cbar_bg.set_yticks([])
 
-            # Eigentliche Farbskala
-            cbar_ax = fig.add_axes([0.06, 0.024, 0.88, 0.022])
+            # Einheit sauber links im Kasten platziert (keine Überlappung mit Skalen-Ticks)
+            cbar_bg.text(
+                0.012, 0.5, f"({unit_str})",
+                color='#38bdf8', fontsize=8.5, fontweight='bold',
+                va='center', ha='left'
+            )
+
+            # Eigentliche Farbskala mit ausreichend Abstand
+            cbar_ax = fig.add_axes([0.065, 0.024, 0.885, 0.022])
             cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal', ticks=cbar_ticks)
             cbar.ax.tick_params(labelsize=8.5, colors='#ffffff', length=3, width=0.8)
-            cbar.set_label(f"Skala ({unit_str})", color='#38bdf8', fontsize=9, fontweight='bold', labelpad=-28, x=-0.035)
 
             filename = f"frame_{lead_h:03d}.webp"
             filepath = os.path.join(output_base, p, dom, filename)
