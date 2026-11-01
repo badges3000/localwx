@@ -5,13 +5,22 @@ DWD ICON-EU Synoptik- & Modellkarten Generator (localwx PRO) - WXCHARTS EDITION
 Professioneller, vollflächiger 16:10 Renderer für DWD ICON-EU Modellkarten im
 ikonischen WXCHARTS-Stil:
 
-Features:
+Features & Optimierungen:
 - Vollflächiges 16:10 Widescreen-Format (1600x1000) ohne schwarze Ränder
-- Optimierte Lambert-Conformal-Projektion für Europa & den gesamten Nordatlantik
-- Originalgetreue WXCHARTS Farbskala (-40°C bis +40°C) mit prägnanter 0°C-Schneegrenze
-- Weiße MSLP-Isobaren (Bodendruck alle 4 hPa) mit schwarzem Text-Halo
-- Automatische Erkennung & Markierung von Hoch- ("H") und Tiefdruckzentren ("T")
-- Edle WXCHARTS-Headerbox & Farbleiste
+- Perfekt abgestimmte Lambert-Conformal-Projektionen für Europa & Mitteleuropa,
+  die zu 100% innerhalb der DWD ICON-EU Modellgrenzen liegen (keine diagonalen
+  schwarzen Schnittkanten mehr im Atlantik!)
+- Originalgetreue WXCHARTS Farbskala (-40°C bis +40°C) mit sichtbarem Arktis-Cyan
+  an der 0°C-Gefriergrenze (kein ausgewaschenes papierweißes "Loch" in Mitteleuropa)
+- Seidenweiche, geglättete MSLP-Isobaren mit schwarzem Text-Halo
+- Intelligenter Druckzentren-Detektor (H & T):
+  * Synoptische Filterung gegen Kleinst-Rauschen & Alpen-Dipole
+  * Plateau-Deduplizierung (verhindert doppelte 'HH' / 'TT' Markierungen)
+  * Prominenz-Filter (echte Druckzentren statt flacher Druckfelder)
+  * Geografische Non-Maximum-Suppression (NMS) für aufgeräumte, professionelle Karten
+- Edles deutsches Header-Overlay oben links; Freihaltung der oberen rechten Ecke
+  für das dynamische Web-Badge der Website
+- Ausgereifte Lauf-Erkennung mit HEAD-Check und automatischem stabilen Fallback
 - Deadlock-freies Multiprocessing & robuster FTPS-Upload
 """
 
@@ -30,7 +39,7 @@ from PIL import Image
 import ftplib
 import ssl
 
-# Scipy für Zentren-Erkennung (Tiefs / Hochs)
+# Scipy für Zentren-Erkennung (Tiefs / Hochs) und Konturglättung
 try:
     import scipy.ndimage as ndi
     SCIPY_AVAILABLE = True
@@ -62,7 +71,25 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. OFFLINE-DOWNLOAD DER KARTEN-GEOMETRIEN (KEIN NETWORK-HANG / DEADLOCK)
+# 1. DEUTSCHE DATUMSFORMATIERUNG
+# ==============================================================================
+
+GERMAN_WEEKDAYS = {
+    0: 'Mo', 1: 'Di', 2: 'Mi', 3: 'Do', 4: 'Fr', 5: 'Sa', 6: 'So'
+}
+GERMAN_MONTHS = {
+    1: 'Jan', 2: 'Feb', 3: 'Mär', 4: 'Apr', 5: 'Mai', 6: 'Jun',
+    7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Okt', 11: 'Nov', 12: 'Dez'
+}
+
+def format_german_date(dt):
+    wd = GERMAN_WEEKDAYS[dt.weekday()]
+    mo = GERMAN_MONTHS[dt.month]
+    return f"{wd}, {dt.day:02d}. {mo} {dt.hour:02d}:00 UTC"
+
+
+# ==============================================================================
+# 2. OFFLINE-DOWNLOAD DER KARTEN-GEOMETRIEN (KEIN NETWORK-HANG / DEADLOCK)
 # ==============================================================================
 
 def setup_cartopy_offline():
@@ -103,53 +130,56 @@ def setup_cartopy_offline():
 
 
 # ==============================================================================
-# 2. WXCHARTS FARBSKALEN & PALETTEN
+# 3. WXCHARTS FARBSKALEN & PALETTEN
 # ==============================================================================
 
-# Original WXCHARTS 40-Stufen Temperatur-Farbskala (-40°C bis +40°C in 2°C-Schritten)
-# Mit dem berühmten, glasklaren Kontrast-Übergang an der 0°C-Gefriergrenze
+# WXCHARTS 40-Stufen Temperatur-Farbskala (-40°C bis +40°C in 2°C-Schritten)
+# Mit optimiertem, edlem Arktis-Cyan (-2°C bis 0°C), das saturiert genug ist,
+# um niemals wie ein leeres weißes Datenloch zu wirken, und dennoch den
+# berühmten Kontrast-Übergang an der 0°C-Gefriergrenze liefert.
 WXCHARTS_TEMP_COLORS = [
-    '#320436',  # -40 bis -38
-    '#46084c',  # -38 bis -36
-    '#5c0d63',  # -36 bis -34
-    '#72127b',  # -34 bis -32
-    '#8a1894',  # -32 bis -30
-    '#a21fad',  # -30 bis -28
-    '#b826be',  # -28 bis -26
-    '#ca2ecc',  # -26 bis -24
-    '#da35d8',  # -24 bis -22
-    '#ea47e3',  # -22 bis -20
-    '#9b5ee6',  # -20 bis -18
-    '#685ce6',  # -18 bis -16
-    '#335ee0',  # -16 bis -14
-    '#207ee8',  # -14 bis -12
-    '#139af2',  # -12 bis -10
-    '#1eb4f6',  # -10 bis -8
-    '#3dccf8',  # -8 bis -6
-    '#74e2fb',  # -6 bis -4
-    '#aef2fc',  # -4 bis -2
-    '#ddf9fd',  # -2 bis 0 (Helles Eis-Cyan)
-    # --- 0°C SCHARFE GRENZE ZU SAFTIGEM FRÜHLINGSGRÜN ---
-    '#82e734',  # 0 bis 2
-    '#5bcf21',  # 2 bis 4
-    '#36be15',  # 4 bis 6
-    '#1ca50d',  # 6 bis 8
-    '#0d8d0c',  # 8 bis 10
-    '#259008',  # 10 bis 12
-    '#52a207',  # 12 bis 14
-    '#8ebc08',  # 14 bis 16
-    '#d2d708',  # 16 bis 18
-    '#f5c507',  # 18 bis 20
-    '#f59f07',  # 20 bis 22
-    '#f57a07',  # 22 bis 24
-    '#f05008',  # 24 bis 26
-    '#e42a0a',  # 26 bis 28
-    '#d10e0e',  # 28 bis 30
-    '#b20314',  # 30 bis 32
-    '#8e011a',  # 32 bis 34
-    '#6b0122',  # 34 bis 36
-    '#4e0026',  # 36 bis 38
-    '#360020',  # 38 bis 40
+    # -40 bis -20: Polare & Arktische Kaltluft (Magenta, Violett, Dunkelblau)
+    '#feb2be',  # -40 bis -38
+    '#fb90a2',  # -38 bis -36
+    '#f7718c',  # -36 bis -34
+    '#f0557c',  # -34 bis -32
+    '#e43e71',  # -32 bis -30
+    '#d42b6a',  # -30 bis -28
+    '#bf1d67',  # -28 bis -26
+    '#a81768',  # -26 bis -24
+    '#8d186c',  # -24 bis -22
+    '#702073',  # -22 bis -20
+    '#522b7d',  # -20 bis -18
+    '#373a8c',  # -18 bis -16
+    '#254d9e',  # -16 bis -14
+    '#1b62b0',  # -14 bis -12
+    '#1578c2',  # -12 bis -10
+    '#158ed1',  # -10 bis -8
+    '#20a3de',  # -8 bis -6
+    '#33b8e8',  # -6 bis -4
+    '#50cbef',  # -4 bis -2
+    '#8be1f6',  # -2 bis 0 (Klares, edles Eis-Cyan - kein ausgewaschenes Papierweiß!)
+    # --- 0°C SCHARFE GRENZE ZU FRISCHEM FRÜHLINGSGRÜN ---
+    '#38c227',  # 0 bis 2
+    '#28af1b',  # 2 bis 4
+    '#1d9c12',  # 4 bis 6
+    '#15880c',  # 6 bis 8
+    '#17780f',  # 8 bis 10
+    '#368b12',  # 10 bis 12
+    '#6aa312',  # 12 bis 14
+    '#a2bc10',  # 14 bis 16
+    '#d5d20f',  # 16 bis 18
+    '#f8c80d',  # 18 bis 20
+    '#f69f0b',  # 20 bis 22
+    '#f3740b',  # 22 bis 24
+    '#ed480c',  # 24 bis 26
+    '#e01f0c',  # 26 bis 28
+    '#c6080b',  # 28 bis 30
+    '#a80112',  # 30 bis 32
+    '#85001a',  # 32 bis 34
+    '#630022',  # 34 bis 36
+    '#470025',  # 36 bis 38
+    '#2e001e',  # 38 bis 40
 ]
 WXCHARTS_TEMP_LEVELS = np.arange(-40, 42, 2)
 WXCHARTS_TEMP_CMAP = mcolors.ListedColormap(WXCHARTS_TEMP_COLORS, name='wxcharts_temp')
@@ -192,25 +222,37 @@ WXCHARTS_JET_CMAP.set_over(WXCHARTS_JET_COLORS[-1])
 
 
 # ==============================================================================
-# 3. DWD GRIB2 DOWNLOAD & PARSING
+# 4. DWD GRIB2 DOWNLOAD & PARSING
 # ==============================================================================
 
 def get_latest_icon_eu_run():
+    """
+    Ermittelt den neuesten verfügbaren ICON-EU Modelllauf (00, 06, 12, 18 UTC).
+    DWD benötigt ca. 3h 40min nach Lauf-Initialisierung zur Veröffentlichung.
+    Prüft vorab per HEAD-Request die Erreichbarkeit und fällt bei Verzögerung
+    automatisch sauber auf den vorherigen Lauf zurück.
+    """
     now = datetime.now(timezone.utc)
-    current_hour = now.hour
-    if current_hour >= 18:
-        ref_hour = 12
-        ref_date = now.replace(hour=ref_hour, minute=0, second=0, microsecond=0)
-    elif current_hour >= 12:
-        ref_hour = 6
-        ref_date = now.replace(hour=ref_hour, minute=0, second=0, microsecond=0)
-    elif current_hour >= 6:
-        ref_hour = 0
-        ref_date = now.replace(hour=ref_hour, minute=0, second=0, microsecond=0)
-    else:
-        ref_hour = 18
-        ref_date = (now - timedelta(days=1)).replace(hour=ref_hour, minute=0, second=0, microsecond=0)
-    return ref_date
+    ref_time = now - timedelta(hours=3, minutes=40)
+    ref_hour = (ref_time.hour // 6) * 6
+    run_date = ref_time.replace(hour=ref_hour, minute=0, second=0, microsecond=0)
+
+    date_str = run_date.strftime("%Y%m%d")
+    run_str = f"{run_date.hour:02d}"
+    check_url = f"https://opendata.dwd.de/weather/nwp/icon-eu/grib/{run_str}/pmsl/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_000_PMSL.grib2.bz2"
+
+    try:
+        req = urllib.request.Request(check_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0 (localwx PRO)'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status == 200:
+                return run_date
+    except Exception:
+        pass
+
+    # Falls der neueste Lauf noch im DWD-Upload steckt, stabilen Vorlauf (-6h) verwenden
+    fallback_date = run_date - timedelta(hours=6)
+    print(f"ℹ️ DWD-Lauf {run_date.strftime('%Y-%m-%d %H:00 UTC')} noch nicht vollständig. Verwende stabilen Vorlauf {fallback_date.strftime('%Y-%m-%d %H:00 UTC')}.")
+    return fallback_date
 
 
 def fetch_dwd_file(url):
@@ -277,52 +319,102 @@ def parse_grib_array(grib_bytes):
 
 
 # ==============================================================================
-# 4. ZENTREN-DETEKTOR (HOCHS & TIEFS IM WXCHARTS-STIL)
+# 5. ZENTREN-DETEKTOR (HOCHS & TIEFS IM WXCHARTS-STIL)
 # ==============================================================================
 
-def find_pressure_extrema(pmsl_grid, lats, lons, min_dist=24):
+def find_pressure_extrema(pmsl_grid, lats, lons, domain='europe'):
     """
-    Findet lokale Tief- ("T") und Hochdruckzentren ("H") in der Bodendruckmatrix.
+    Findet meteorologisch signifikante Hoch- ("H") und Tiefdruckzentren ("T").
+    Verhindert Häufungen, Mehrfachmarkierungen bei Plateaus (z.B. 'HH') und
+    beschränkt die Zentren auf die dominanten synoptischen Druckgebilde.
     """
     if not SCIPY_AVAILABLE or pmsl_grid is None:
         return [], []
 
     try:
-        # Sanfte Glättung gegen Kleinst-Rauschen
-        smoothed = ndi.gaussian_filter(pmsl_grid, sigma=2.2)
+        # 1. Stärkere synoptische Glättung gegen orographisches & numerisches Rauschen
+        # Auf dem 0.0625° Gitter entsprechen sigma=8.0 ca. 55 km
+        smoothed = ndi.gaussian_filter(pmsl_grid, sigma=8.0)
 
-        local_min = (smoothed == ndi.minimum_filter(smoothed, size=min_dist, mode='nearest'))
-        local_max = (smoothed == ndi.maximum_filter(smoothed, size=min_dist, mode='nearest'))
+        # 2. Neighborhood filter für lokale Extrema
+        min_dist = 64 if domain == 'europe' else 44
+        local_min = (smoothed == ndi.minimum_filter(smoothed, size=min_dist, mode='reflect'))
+        local_max = (smoothed == ndi.maximum_filter(smoothed, size=min_dist, mode='reflect'))
 
-        lows = []
-        highs = []
+        # 3. Plateaus und benachbarte identische Werte deduplizieren (verhindert 'HH' und 'TT')
+        labeled_min, num_min = ndi.label(local_min)
+        labeled_max, num_max = ndi.label(local_max)
 
+        min_candidates = []
+        for i in range(1, num_min + 1):
+            coords = np.argwhere(labeled_min == i)
+            r, c = coords.mean(axis=0)
+            r, c = int(round(r)), int(round(c))
+            val = float(smoothed[r, c])
+            min_candidates.append((r, c, val))
+
+        max_candidates = []
+        for i in range(1, num_max + 1):
+            coords = np.argwhere(labeled_max == i)
+            r, c = coords.mean(axis=0)
+            r, c = int(round(r)), int(round(c))
+            val = float(smoothed[r, c])
+            max_candidates.append((r, c, val))
+
+        # 4. Prominenz-Filter (Zentrum muss sich signifikant von seiner Umgebung abheben)
         nj, ni = pmsl_grid.shape
-        margin = 12
+        margin = 25
 
-        min_indices = np.argwhere(local_min)
-        for r, c in min_indices:
+        valid_lows = []
+        for r, c, val in min_candidates:
             if margin <= r < nj - margin and margin <= c < ni - margin:
-                val = smoothed[r, c]
-                # Echtes signifikantes Tiefdruckzentrum
-                if val <= 1012.0:
-                    lows.append((float(lons[c]), float(lats[r]), int(round(val))))
+                ring = smoothed[max(0, r-28):min(nj, r+29), max(0, c-28):min(ni, c+29)]
+                prominence = float(np.mean(ring) - val)
+                # Tiefdruck: mind. 0.8 hPa tiefer als Umgebung & Druck <= 1016 hPa
+                if prominence >= 0.8 and val <= 1016.0:
+                    valid_lows.append((float(lons[c]), float(lats[r]), int(round(val)), val))
 
-        max_indices = np.argwhere(local_max)
-        for r, c in max_indices:
+        valid_highs = []
+        for r, c, val in max_candidates:
             if margin <= r < nj - margin and margin <= c < ni - margin:
-                val = smoothed[r, c]
-                # Echtes signifikantes Hochdruckzentrum
-                if val >= 1018.0:
-                    highs.append((float(lons[c]), float(lats[r]), int(round(val))))
+                ring = smoothed[max(0, r-28):min(nj, r+29), max(0, c-28):min(ni, c+29)]
+                prominence = float(val - np.mean(ring))
+                # Hochdruck: mind. 0.8 hPa höher als Umgebung & Druck >= 1018 hPa
+                if prominence >= 0.8 and val >= 1018.0:
+                    valid_highs.append((float(lons[c]), float(lats[r]), int(round(val)), val))
 
-        return lows, highs
+        # 5. Non-Maximum Suppression (NMS) mit Mindestabstand in Kilometern
+        min_sep_km = 450.0 if domain == 'europe' else 260.0
+
+        def distance_km(lon1, lat1, lon2, lat2):
+            dlat = (lat2 - lat1) * 111.0
+            dlon = (lon2 - lon1) * 111.0 * np.cos(np.radians((lat1 + lat2) * 0.5))
+            return np.sqrt(dlat * dlat + dlon * dlon)
+
+        # Tiefs nach tiefstem Druck zuerst sortieren
+        valid_lows.sort(key=lambda x: x[3])
+        filtered_lows = []
+        for item in valid_lows:
+            lon_c, lat_c, p_val, _ = item
+            if all(distance_km(lon_c, lat_c, fl[0], fl[1]) > min_sep_km for fl in filtered_lows):
+                filtered_lows.append((lon_c, lat_c, p_val))
+
+        # Hochs nach höchstem Druck zuerst sortieren
+        valid_highs.sort(key=lambda x: -x[3])
+        filtered_highs = []
+        for item in valid_highs:
+            lon_c, lat_c, p_val, _ = item
+            if all(distance_km(lon_c, lat_c, fh[0], fh[1]) > min_sep_km for fh in filtered_highs):
+                filtered_highs.append((lon_c, lat_c, p_val))
+
+        max_count = 6 if domain == 'europe' else 3
+        return filtered_lows[:max_count], filtered_highs[:max_count]
     except Exception:
         return [], []
 
 
 # ==============================================================================
-# 5. KARTEN-RENDERING EINES KOMPLETTEN ZEITSCHRITTS (TASK)
+# 6. KARTEN-RENDERING EINES KOMPLETTEN ZEITSCHRITTS (TASK)
 # ==============================================================================
 
 def render_step_task(task_args):
@@ -377,28 +469,33 @@ def render_step_task(task_args):
         't2m': (t2m_arr - 273.15) if t2m_arr is not None else None
     }
 
-    # Berechne Tief- & Hochdruckzentren für MSLP Isobaren
-    lows, highs = find_pressure_extrema(pmsl_hpa, lats, lons)
+    # Druckzentren für beide Domains mit abgestimmtem Detaillierungsgrad ermitteln
+    lows_europe, highs_europe = find_pressure_extrema(pmsl_hpa, lats, lons, domain='europe')
+    lows_germany, highs_germany = find_pressure_extrema(pmsl_hpa, lats, lons, domain='germany')
 
     lon_mesh, lat_mesh = np.meshgrid(lons, lats)
 
-    # Projektionen mit zentrierter Ausrichtung
+    # Sanft vorgefiltertes PMSL für seidenweiche, ästhetische Isobaren
+    pmsl_smooth = ndi.gaussian_filter(pmsl_hpa, sigma=1.6) if (SCIPY_AVAILABLE and pmsl_hpa is not None) else pmsl_hpa
+
+    # Optimierte LambertConformal Projektionen, die 100% innerhalb der ICON-EU Grenzen liegen (-23.5°W bis 45.0°E)
     proj_europe = ccrs.LambertConformal(
-        central_longitude=5.0,
-        central_latitude=52.0,
+        central_longitude=10.0,
+        central_latitude=51.0,
         standard_parallels=(35.0, 65.0)
     ) if CARTOPY_AVAILABLE else None
 
     proj_germany = ccrs.LambertConformal(
         central_longitude=10.5,
-        central_latitude=51.0,
+        central_latitude=51.2,
         standard_parallels=(45.0, 55.0)
     ) if CARTOPY_AVAILABLE else None
 
-    # Exakte 16:10 Bounding-Boxen in Projektionsmetern
-    # Verhältnis: (x_max - x_min) / (y_max - y_min) == 1.60000000 (100% randlos!)
-    extent_europe = (-2900000, 2700000, -1550000, 1950000)   # 5600 km x 3500 km
-    extent_germany = (-720000, 720000, -450000, 450000)      # 1440 km x 900 km
+    # Exakte 16:10 Bounding-Boxen in Projektionsmetern (1600x1000 ohne schwarze Ränder)
+    # Europe: 3800 km x 2375 km (16:10) - deckt von Irland bis Ukraine & Skandinavien bis Mittelmeer ab
+    extent_europe = (-1900000, 1900000, -1350000, 1025000)
+    # Germany: 1520 km x 950 km (16:10) - perfekt zentriertes Mitteleuropa
+    extent_germany = (-760000, 760000, -475000, 475000)
 
     params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
     domains = ['europe', 'germany']
@@ -408,22 +505,22 @@ def render_step_task(task_args):
         # WXCHARTS Parameter-Konfiguration
         if p == 't850_gp':
             field_val = data['t850']
-            contour_val = data['pmsl']  # WXCHARTS Standard: 850 hPa Temp MIT Bodendruck-Isobaren!
+            contour_val = pmsl_smooth
             title_str = "850 hPa Temperatur (°C) & Bodendruck (hPa)"
             unit_str = "°C"
             cmap, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_LEVELS
-            contour_levels = np.arange(960, 1052, 4)
+            contour_levels = np.arange(960, 1056, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(-40, 44, 4)
             is_pmsl_contour = True
 
         elif p == 'z500_mslp':
             field_val = data['fi500']
-            contour_val = data['pmsl']
+            contour_val = pmsl_smooth
             title_str = "500 hPa Geopotentialhöhe (gpdm) & Bodendruck (hPa)"
             unit_str = "gpdm"
             cmap, levels = WXCHARTS_Z500_CMAP, WXCHARTS_Z500_LEVELS
-            contour_levels = np.arange(960, 1052, 4)
+            contour_levels = np.arange(960, 1056, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(496, 596, 8)
             is_pmsl_contour = True
@@ -431,40 +528,41 @@ def render_step_task(task_args):
         elif p == 'jet300':
             field_val = data['jet300']
             contour_val = data['fi300']
-            title_str = "300 hPa Wind & Jetstream (km/h) & 300 hPa Isohypsen"
+            title_str = "300 hPa Jetstream & Höhenwind (km/h) & 300 hPa Isohypsen"
             unit_str = "km/h"
             cmap, levels = WXCHARTS_JET_CMAP, WXCHARTS_JET_LEVELS
-            contour_levels = np.arange(840, 988, 8)
+            contour_levels = np.arange(840, 992, 8)
             contour_fmt = "%d"
             cbar_ticks = np.arange(40, 370, 30)
             is_pmsl_contour = False
 
         else:  # t2m_wind
             field_val = data['t2m']
-            contour_val = data['pmsl']
+            contour_val = pmsl_smooth
             title_str = "2m Temperatur (°C) & Bodendruck (hPa)"
             unit_str = "°C"
             cmap, levels = WXCHARTS_TEMP_CMAP, WXCHARTS_TEMP_LEVELS
-            contour_levels = np.arange(960, 1052, 4)
+            contour_levels = np.arange(960, 1056, 4)
             contour_fmt = "%d"
             cbar_ticks = np.arange(-40, 44, 4)
             is_pmsl_contour = True
 
         for dom in domains:
-            # 1600 x 1000 Pixel (Perfekt 16:10 für moderne Bildschirme & Mobile)
+            # 1600 x 1000 Pixel (Vollflächig 16:10 für moderne Bildschirme & Mobile)
             fig = plt.figure(figsize=(16.0, 10.0), dpi=100, facecolor='#0b0f19')
 
             if CARTOPY_AVAILABLE:
                 cur_proj = proj_europe if dom == 'europe' else proj_germany
                 x_min, x_max, y_min, y_max = extent_europe if dom == 'europe' else extent_germany
+                lows, highs = (lows_europe, highs_europe) if dom == 'europe' else (lows_germany, highs_germany)
 
                 # Vollflächiges Koordinatensystem: 0% Margin (Edge-to-Edge)
                 ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection=cur_proj)
                 ax.set_xlim(x_min, x_max)
                 ax.set_ylim(y_min, y_max)
-                ax.set_facecolor('#0b1120')  # Dunkles Ozean-Blau gegen weiße NaNs
+                ax.set_facecolor('#0b1120')
 
-                # 1. Unterlegte Kartenbasis (falls Randbereiche außerhalb des ICON-Gitters liegen)
+                # 1. Unterlegte Kartenbasis
                 try:
                     ax.add_feature(cfeature.OCEAN, facecolor='#0b1120', zorder=0)
                     ax.add_feature(cfeature.LAND, facecolor='#111827', zorder=0)
@@ -486,22 +584,23 @@ def render_step_task(task_args):
                         cfeature.LAKES.with_scale('50m'),
                         edgecolor='#0f172a', facecolor='none', linewidth=0.8, zorder=4
                     )
-                    # Bundesländer / Provinzen (dezent gestrichelt für sofortige Orientierung in Deutschland)
+                    # Bundesländer / Provinzen
                     states_provinces = cfeature.NaturalEarthFeature(
                         category='cultural',
                         name='admin_1_states_provinces_lines',
                         scale='50m',
                         facecolor='none'
                     )
+                    state_alpha = 0.65 if dom == 'germany' else 0.35
                     ax.add_feature(
                         states_provinces,
                         edgecolor='#0f172a',
                         linewidth=0.8,
                         linestyle='--',
-                        alpha=0.65,
+                        alpha=state_alpha,
                         zorder=4
                     )
-                    # Küstenlinien (Doppel-Kontur für maximale Sichtbarkeit auf jedem Farbuntergrund)
+                    # Küstenlinien (Doppel-Kontur für maximale Sichtbarkeit)
                     ax.add_feature(
                         cfeature.COASTLINE.with_scale('50m'),
                         edgecolor='#ffffff', linewidth=2.4, alpha=0.40, zorder=4
@@ -532,7 +631,7 @@ def render_step_task(task_args):
                     )
                     clabels = ax.clabel(
                         cs, inline=True, fmt=contour_fmt,
-                        fontsize=9, colors='#ffffff', inline_spacing=12
+                        fontsize=9, colors='#ffffff', inline_spacing=18
                     )
                     for lbl in clabels:
                         lbl.set_fontweight('bold')
@@ -540,26 +639,29 @@ def render_step_task(task_args):
 
                 # 5. Tief- ("T") & Hochdruckzentren ("H") markieren (nur bei Bodendruck)
                 if is_pmsl_contour:
-                    halo_stroke = [pe.withStroke(linewidth=3.2, foreground='#000000')]
+                    halo_stroke = [pe.withStroke(linewidth=3.5, foreground='#000000')]
+                    x_pad = (x_max - x_min) * 0.04
+                    y_pad = (y_max - y_min) * 0.06
+
                     # Tiefdruckzentren (kräftiges Rot)
                     for lon_c, lat_c, p_val in lows:
                         pt_proj = cur_proj.transform_point(lon_c, lat_c, ccrs.PlateCarree())
-                        if x_min <= pt_proj[0] <= x_max and y_min <= pt_proj[1] <= y_max:
+                        if (x_min + x_pad) <= pt_proj[0] <= (x_max - x_pad) and (y_min + y_pad) <= pt_proj[1] <= (y_max - y_pad):
                             ax.text(
                                 lon_c, lat_c, f"T\n{p_val}",
                                 transform=ccrs.PlateCarree(),
-                                color='#ef4444', fontsize=11, fontweight='black',
+                                color='#ef4444', fontsize=11.5, fontweight='black',
                                 ha='center', va='center', zorder=6,
                                 path_effects=halo_stroke
                             )
                     # Hochdruckzentren (leuchtendes Cyan/Blau)
                     for lon_c, lat_c, p_val in highs:
                         pt_proj = cur_proj.transform_point(lon_c, lat_c, ccrs.PlateCarree())
-                        if x_min <= pt_proj[0] <= x_max and y_min <= pt_proj[1] <= y_max:
+                        if (x_min + x_pad) <= pt_proj[0] <= (x_max - x_pad) and (y_min + y_pad) <= pt_proj[1] <= (y_max - y_pad):
                             ax.text(
                                 lon_c, lat_c, f"H\n{p_val}",
                                 transform=ccrs.PlateCarree(),
-                                color='#38bdf8', fontsize=11, fontweight='black',
+                                color='#38bdf8', fontsize=11.5, fontweight='black',
                                 ha='center', va='center', zorder=6,
                                 path_effects=halo_stroke
                             )
@@ -576,67 +678,54 @@ def render_step_task(task_args):
                     ax.clabel(cs, inline=True, fmt=contour_fmt, fontsize=9, colors='#ffffff')
 
             # ==================================================================
-            # 6. WXCHARTS HEADER OVERLAY (OBEN LINKS)
+            # 7. WXCHARTS HEADER OVERLAY (OBEN LINKS)
             # ==================================================================
-            init_str = run_date.strftime("%a, %d. %b %H:00 UTC")
-            valid_str = valid_date.strftime("%a, %d. %b %H:00 UTC")
+            init_str = format_german_date(run_date)
+            valid_str = format_german_date(valid_date)
+            domain_label = "Europa" if dom == 'europe' else "Mitteleuropa"
 
             header_text = (
-                f"localwx.de  •  DWD ICON-EU (0.0625°)  •  {title_str}\n"
+                f"localwx.de  •  DWD ICON-EU (0.0625°)  •  {domain_label}\n"
+                f"{title_str}\n"
                 f"Modell-Lauf: {init_str}   |   Gültig: {valid_str} (+{lead_h:02d}h)"
             )
             ax.text(
                 0.015, 0.985, header_text,
                 transform=ax.transAxes,
-                color='#ffffff', fontsize=10.5, fontweight='bold',
+                color='#ffffff', fontsize=10, fontweight='bold',
                 linespacing=1.35, va='top', ha='left',
                 bbox=dict(
                     boxstyle='round,pad=0.45',
                     facecolor='#0b0f19',
-                    alpha=0.88,
+                    alpha=0.90,
                     edgecolor='#334155',
                     linewidth=0.8
                 ),
                 zorder=10
             )
-
-            # Oben Rechts: WXCharts-Badge
-            domain_label = "EUROPA & NORDATLANTIK" if dom == 'europe' else "MITTELEUROPA"
-            ax.text(
-                0.985, 0.985, f"localwx PRO  •  {domain_label}",
-                transform=ax.transAxes,
-                color='#38bdf8', fontsize=9.5, fontweight='bold',
-                va='top', ha='right',
-                bbox=dict(
-                    boxstyle='round,pad=0.35',
-                    facecolor='#0b0f19',
-                    alpha=0.88,
-                    edgecolor='#0284c7',
-                    linewidth=0.8
-                ),
-                zorder=10
-            )
+            # Hinweis: Die obere rechte Ecke wird bewusst frei gelassen, da die
+            # Website dort das interaktive Vorhersage-Badge darstellt.
 
             # ==================================================================
-            # 7. WXCHARTS BOTTOM COLORBAR OVERLAY (UNTEN)
+            # 8. WXCHARTS BOTTOM COLORBAR OVERLAY (UNTEN)
             # ==================================================================
-            # Hintergrundleiste für die Legende
-            cbar_bg = fig.add_axes([0.02, 0.015, 0.96, 0.045], facecolor='#0b0f19')
-            cbar_bg.patch.set_alpha(0.88)
+            # Hintergrundleiste für die Legende (Glassmorphism)
+            cbar_bg = fig.add_axes([0.02, 0.015, 0.96, 0.046], facecolor='#0b0f19')
+            cbar_bg.patch.set_alpha(0.90)
             cbar_bg.patch.set_edgecolor('#334155')
             cbar_bg.patch.set_linewidth(0.8)
             cbar_bg.set_xticks([])
             cbar_bg.set_yticks([])
 
-            # Einheit sauber links im Kasten platziert (keine Überlappung mit Skalen-Ticks)
+            # Einheit sauber links im Kasten platziert
             cbar_bg.text(
                 0.012, 0.5, f"({unit_str})",
                 color='#38bdf8', fontsize=8.5, fontweight='bold',
                 va='center', ha='left'
             )
 
-            # Eigentliche Farbskala mit ausreichend Abstand
-            cbar_ax = fig.add_axes([0.065, 0.024, 0.885, 0.022])
+            # Farbskala mit optimalem Kontrast und Tick-Abständen
+            cbar_ax = fig.add_axes([0.062, 0.024, 0.900, 0.022])
             cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal', ticks=cbar_ticks)
             cbar.ax.tick_params(labelsize=8.5, colors='#ffffff', length=3, width=0.8)
 
@@ -659,7 +748,7 @@ def render_step_task(task_args):
 
 
 # ==============================================================================
-# 6. PIPELINE GENERATOR
+# 7. PIPELINE GENERATOR
 # ==============================================================================
 
 def generate_synoptic_dataset():
@@ -679,7 +768,7 @@ def generate_synoptic_dataset():
     params = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
     domains = ['europe', 'germany']
     steps = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 42, 48, 54, 60, 72, 84, 96, 120]
-    print(f"📦 Verarbeite {len(steps)} Zeitschritte (0h bis +120h) mit {len(steps)*8} Karten...")
+    print(f"📦 Verarbeite bis zu {len(steps)} Zeitschritte (0h bis +120h) mit {len(steps)*8} Karten...")
 
     manifest = {
         "model": "DWD ICON-EU",
@@ -722,12 +811,20 @@ def generate_synoptic_dataset():
         for dom in domains:
             manifest["frames"][p][dom].sort(key=lambda x: x['lead_h'])
 
+    # Tatsächlich generierte Zeitschritte im Manifest hinterlegen
+    available_steps = sorted(list(set(
+        f["lead_h"] for p in params for dom in domains for f in manifest["frames"][p][dom]
+    )))
+    manifest["steps"] = available_steps if available_steps else steps
+    if available_steps:
+        manifest["max_lead_h"] = max(available_steps)
+
     manifest_path = os.path.join(output_base, "manifest.json")
     with open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     duration = round(time.time() - start_time, 1)
-    print(f"✅ Alle 168 synoptischen Modellkarten in {duration}s erfolgreich generiert!")
+    print(f"✅ Synoptische Modellkarten in {duration}s erfolgreich generiert!")
 
     upload_synoptic_to_ftp(output_base)
 
