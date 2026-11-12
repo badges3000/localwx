@@ -34,7 +34,7 @@ jobs:
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pillow scipy matplotlib cartopy eccodes
+          pip install numpy pillow scipy matplotlib cartopy eccodes ecmwf-opendata
 
       - name: Run DWD Synoptic Charts Generator & Uploader
         env:
