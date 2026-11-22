@@ -95,7 +95,7 @@ PARAM_CONFIGS = {
         'scale_type': 'rain'
     },
     'snow': {
-        'dwd_var': 'freshsnow_acc',
+        'dwd_var': 'snow_gsp+snow_con',
         'folder': 'snow',
         'title': 'Neuschneemenge',
         'unit': 'cm',
@@ -430,19 +430,23 @@ def reproject_rgba_to_web_mercator(rgba_array, lat_min=43.18, lat_max=58.08, tar
     return rgba_array[src_row_idx[:, None], src_col_idx[None, :]]
 
 
-def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_size=(1024, 1024)):
-    """
-    Liest die GRIB2-Datei mit eccodes, wendet die Vektor-Colormap an und speichert das PNG.
-    """
-    if not os.path.exists(grib_path):
-        return None
+COLORIZERS = {
+    'sigwx': colorize_sigwx,
+    'precip_rate': colorize_precip_rate,
+    'wind': colorize_wind,
+    'cape': colorize_cape,
+    'rain': colorize_rain,
+    'snow': colorize_snow,
+}
 
-    try:
-        with open(grib_path, 'rb') as f:
-            gid = eccodes.codes_grib_new_from_file(f)
-            if gid is None:
-                return None
 
+def _read_grib_field(grib_path):
+    """Liest Gitterwerte und Geometrie-Metadaten aus einer GRIB2-Datei."""
+    with open(grib_path, 'rb') as f:
+        gid = eccodes.codes_grib_new_from_file(f)
+        if gid is None:
+            return None
+        try:
             Ni = eccodes.codes_get(gid, 'Ni')
             Nj = eccodes.codes_get(gid, 'Nj')
 
@@ -458,8 +462,10 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
                 lon_last = eccodes.codes_get(gid, 'longitudeOfLastGridPoint') / 1e6
 
             # Längengrade normalisieren (z.B. 356.06° -> -3.94°)
-            if lon_first > 180: lon_first -= 360
-            if lon_last > 180: lon_last -= 360
+            if lon_first > 180:
+                lon_first -= 360
+            if lon_last > 180:
+                lon_last -= 360
 
             # Exakte Gültigkeits-Uhrzeit aus dem GRIB-Header lesen
             exact_valid_iso = None
@@ -473,50 +479,55 @@ def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_si
                 pass
 
             j_scans_pos = eccodes.codes_get(gid, 'jScansPositively')
-            values = eccodes.codes_get_values(gid)
+            grid_2d = eccodes.codes_get_values(gid).reshape((Nj, Ni))
+            return grid_2d, (lat_first, lon_first, lat_last, lon_last, j_scans_pos, exact_valid_iso)
+        finally:
             eccodes.codes_release(gid)
 
-            grid_2d = values.reshape((Nj, Ni))
 
-            # Vektorisierte Farb-Transformation je nach Skalentyp
-            if scale_type == 'sigwx':
-                rgba_array = colorize_sigwx(grid_2d)
-            elif scale_type == 'precip_rate':
-                rgba_array = colorize_precip_rate(grid_2d)
-            elif scale_type == 'wind':
-                rgba_array = colorize_wind(grid_2d)
-            elif scale_type == 'cape':
-                rgba_array = colorize_cape(grid_2d)
-            elif scale_type == 'rain':
-                rgba_array = colorize_rain(grid_2d)
-            elif scale_type == 'snow':
-                rgba_array = colorize_snow(grid_2d)
-            else:
-                rgba_array = colorize_sigwx(grid_2d)
+def _save_mercator_webp(rgba_array, meta, output_webp_path):
+    """Entzerrt ein RGBA-Array nach EPSG:3857 (Web-Mercator) und speichert es verlustfrei als WebP."""
+    lat_first, lon_first, lat_last, lon_last, j_scans_pos, exact_valid_iso = meta
 
-            # Falls Scan von Süd nach Nord läuft, vertikal spiegeln (Nord oben)
-            if j_scans_pos == 1:
-                rgba_array = np.flipud(rgba_array)
+    # Falls Scan von Süd nach Nord läuft, vertikal spiegeln (Nord oben)
+    if j_scans_pos == 1:
+        rgba_array = np.flipud(rgba_array)
 
-            min_lat = round(min(lat_first, lat_last), 2)
-            max_lat = round(max(lat_first, lat_last), 2)
-            min_lon = round(min(lon_first, lon_last), 2)
-            max_lon = round(max(lon_first, lon_last), 2)
+    min_lat = round(min(lat_first, lat_last), 2)
+    max_lat = round(max(lat_first, lat_last), 2)
+    min_lon = round(min(lon_first, lon_last), 2)
+    max_lon = round(max(lon_first, lon_last), 2)
 
-            # Plausibilitätsprüfung für DWD ICON-D2 Regular Grid
-            if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
-                min_lat, max_lat = 43.18, 58.08
-                min_lon, max_lon = -3.94, 20.34
+    # Plausibilitätsprüfung für DWD ICON-D2 Regular Grid
+    if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
+        min_lat, max_lat = 43.18, 58.08
+        min_lon, max_lon = -3.94, 20.34
 
-            # Exakte Web-Mercator (EPSG:3857) Entzerrung für Leaflet
-            warped_rgba = reproject_rgba_to_web_mercator(rgba_array, min_lat, max_lat, 1400, 1400)
+    # Exakte Web-Mercator (EPSG:3857) Entzerrung für Leaflet
+    warped_rgba = reproject_rgba_to_web_mercator(rgba_array, min_lat, max_lat, 1400, 1400)
 
-            img = Image.fromarray(warped_rgba, mode='RGBA')
-            # 100% verlustfreies WebP (Zero Artifacts) mit Alpha-Transparenz
-            img.save(output_png_path, 'WEBP', lossless=True, method=6)
+    img = Image.fromarray(warped_rgba, mode='RGBA')
+    # 100% verlustfreies WebP (Zero Artifacts) mit Alpha-Transparenz
+    img.save(output_webp_path, 'WEBP', lossless=True, method=6)
 
-            return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
+    return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
 
+
+def render_grib_to_png(grib_path, output_png_path, scale_type='sigwx', target_size=(1024, 1024)):
+    """
+    Liest die GRIB2-Datei mit eccodes, wendet die Vektor-Colormap an und speichert das WebP.
+    """
+    if not os.path.exists(grib_path):
+        return None
+
+    try:
+        field_res = _read_grib_field(grib_path)
+        if field_res is None:
+            return None
+        grid_2d, meta = field_res
+        colorize_fn = COLORIZERS.get(scale_type, colorize_sigwx)
+        rgba_array = colorize_fn(grid_2d)
+        return _save_mercator_webp(rgba_array, meta, output_png_path)
     except Exception as e:
         print(f"Fehler beim Rendern von {grib_path}: {e}")
         return [[43.18, -3.94], [58.08, 20.34]], None
@@ -529,64 +540,57 @@ def render_hourly_precip_diff(grib_curr_path, grib_prev_path, output_webp_path):
     if not os.path.exists(grib_curr_path) or not os.path.exists(grib_prev_path):
         return None
     try:
-        with open(grib_curr_path, 'rb') as fc, open(grib_prev_path, 'rb') as fp:
-            gid_c = eccodes.codes_grib_new_from_file(fc)
-            gid_p = eccodes.codes_grib_new_from_file(fp)
-            if not gid_c or not gid_p:
-                return None
+        curr_res = _read_grib_field(grib_curr_path)
+        prev_res = _read_grib_field(grib_prev_path)
+        if not curr_res or not prev_res:
+            return None
 
-            Ni = eccodes.codes_get(gid_c, 'Ni')
-            Nj = eccodes.codes_get(gid_c, 'Nj')
-            lat_first = eccodes.codes_get(gid_c, 'latitudeOfFirstGridPoint') / 1e6
-            lon_first = eccodes.codes_get(gid_c, 'longitudeOfFirstGridPoint') / 1e6
-            lat_last = eccodes.codes_get(gid_c, 'latitudeOfLastGridPoint') / 1e6
-            lon_last = eccodes.codes_get(gid_c, 'longitudeOfLastGridPoint') / 1e6
-            j_scans_pos = eccodes.codes_get(gid_c, 'jScansPositively')
+        vals_curr, meta = curr_res
+        vals_prev, _ = prev_res
 
-            if lon_first > 180: lon_first -= 360
-            if lon_last > 180: lon_last -= 360
-
-            exact_valid_iso = None
-            try:
-                valid_date = str(eccodes.codes_get(gid_c, 'validityDate'))
-                valid_time_int = eccodes.codes_get(gid_c, 'validityTime')
-                valid_time_str = f"{valid_time_int:04d}"
-                valid_dt = datetime.strptime(f"{valid_date}{valid_time_str}", "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
-                exact_valid_iso = valid_dt.isoformat()
-            except Exception:
-                pass
-
-            vals_curr = eccodes.codes_get_values(gid_c).reshape((Nj, Ni))
-            vals_prev = eccodes.codes_get_values(gid_p).reshape((Nj, Ni))
-            eccodes.codes_release(gid_c)
-            eccodes.codes_release(gid_p)
-
-            # Echte stündliche Niederschlagsrate:
-            hourly_rain = np.maximum(0.0, vals_curr - vals_prev)
-            rgba_array = colorize_precip_rate(hourly_rain)
-
-            if j_scans_pos == 1:
-                rgba_array = np.flipud(rgba_array)
-
-            min_lat = round(min(lat_first, lat_last), 2)
-            max_lat = round(max(lat_first, lat_last), 2)
-            min_lon = round(min(lon_first, lon_last), 2)
-            max_lon = round(max(lon_first, lon_last), 2)
-
-            if not (40 <= min_lat <= 46 and 55 <= max_lat <= 60 and -6 <= min_lon <= 0 and 17 <= max_lon <= 24):
-                min_lat, max_lat = 43.18, 58.08
-                min_lon, max_lon = -3.94, 20.34
-
-            # Exakte Web-Mercator (EPSG:3857) Entzerrung für Leaflet
-            warped_rgba = reproject_rgba_to_web_mercator(rgba_array, min_lat, max_lat, 1400, 1400)
-
-            img = Image.fromarray(warped_rgba, mode='RGBA')
-            img.save(output_webp_path, 'WEBP', lossless=True, method=6)
-
-            return [[min_lat, min_lon], [max_lat, max_lon]], exact_valid_iso
+        # Echte stündliche Niederschlagsrate:
+        hourly_rain = np.maximum(0.0, vals_curr - vals_prev)
+        rgba_array = colorize_precip_rate(hourly_rain)
+        return _save_mercator_webp(rgba_array, meta, output_webp_path)
     except Exception as e:
         print(f"Fehler bei Niederschlagsdifferenz: {e}")
         return None
+
+
+def render_combined_snow(grib_gsp_path, grib_con_path, output_webp_path):
+    """
+    Summiert akkumulierten großskaligen (snow_gsp) und konvektiven (snow_con) Schneefall in kg/m² (~cm).
+    """
+    if not grib_gsp_path or not os.path.exists(grib_gsp_path):
+        return None
+    try:
+        gsp_res = _read_grib_field(grib_gsp_path)
+        if not gsp_res:
+            return None
+
+        vals_gsp, meta = gsp_res
+        total_snow = clean_grib_grid(vals_gsp, max_valid=500.0, min_valid=0.0)
+
+        if grib_con_path and os.path.exists(grib_con_path):
+            con_res = _read_grib_field(grib_con_path)
+            if con_res and con_res[0].shape == total_snow.shape:
+                total_snow = total_snow + clean_grib_grid(con_res[0], max_valid=500.0, min_valid=0.0)
+
+        rgba_array = colorize_snow(total_snow)
+        return _save_mercator_webp(rgba_array, meta, output_webp_path)
+    except Exception as e:
+        print(f"Fehler bei kombinierter Schneesumme: {e}")
+        return None
+
+
+def _cleanup_files(*paths):
+    """Entfernt temporäre GRIB2-Dateien ohne Fehlerabbruch."""
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 def process_single_step(step, date_str, hour_str, run_date, param_key, output_dir, temp_dir):
@@ -611,33 +615,33 @@ def process_single_step(step, date_str, hour_str, run_date, param_key, output_di
             empty = Image.new('RGBA', (1400, 1400), (0, 0, 0, 0))
             empty.save(output_path, 'WEBP', lossless=True)
             return step, webp_name, [[43.18, -3.94], [58.08, 20.34]], step_time.isoformat()
-        else:
-            grib_curr = download_dwd_file(date_str, hour_str, step, var='tot_prec', temp_dir=temp_dir)
-            grib_prev = download_dwd_file(date_str, hour_str, step - 1, var='tot_prec', temp_dir=temp_dir)
-            if not grib_curr or not grib_prev:
-                return step, None, None, None
 
-            res = render_hourly_precip_diff(grib_curr, grib_prev, output_path)
-            for f in [grib_curr, grib_prev]:
-                if f and os.path.exists(f):
-                    try: os.remove(f)
-                    except Exception: pass
+        grib_curr = download_dwd_file(date_str, hour_str, step, var='tot_prec', temp_dir=temp_dir)
+        grib_prev = download_dwd_file(date_str, hour_str, step - 1, var='tot_prec', temp_dir=temp_dir)
+        res = render_hourly_precip_diff(grib_curr, grib_prev, output_path) if (grib_curr and grib_prev) else None
+        _cleanup_files(grib_curr, grib_prev)
+        if res:
+            bounds, exact_iso = res
+            return step, webp_name, bounds, exact_iso or step_time.isoformat()
+        return step, None, None, None
 
-            if res:
-                bounds, exact_iso = res
-                return step, webp_name, bounds, exact_iso or step_time.isoformat()
-            return step, None, None, None
+    # Spezialfall: Neuschneemenge = großskaliger (snow_gsp) + konvektiver (snow_con) Schneefall
+    if param_key == 'snow':
+        grib_gsp = download_dwd_file(date_str, hour_str, step, var='snow_gsp', temp_dir=temp_dir)
+        grib_con = download_dwd_file(date_str, hour_str, step, var='snow_con', temp_dir=temp_dir)
+        res = render_combined_snow(grib_gsp, grib_con, output_path) if grib_gsp else None
+        _cleanup_files(grib_gsp, grib_con)
+        if res:
+            bounds, exact_iso = res
+            return step, webp_name, bounds, exact_iso or step_time.isoformat()
+        return step, None, None, None
 
     grib_file = download_dwd_file(date_str, hour_str, step, var=dwd_var, temp_dir=temp_dir)
     if not grib_file:
         return step, None, None, None
 
     res = render_grib_to_png(grib_file, output_path, scale_type=scale_type)
-    if os.path.exists(grib_file):
-        try:
-            os.remove(grib_file)
-        except Exception:
-            pass
+    _cleanup_files(grib_file)
 
     if res:
         bounds, exact_iso = res
