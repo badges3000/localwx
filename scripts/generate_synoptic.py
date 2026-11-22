@@ -49,6 +49,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.colorbar as mcolorbar
 import matplotlib.patheffects as pe
 
 # Cartopy Setup
@@ -223,6 +224,70 @@ WXCHARTS_JET_CMAP.set_under(WXCHARTS_JET_COLORS[0])
 WXCHARTS_JET_CMAP.set_over(WXCHARTS_JET_COLORS[-1])
 
 
+# WXCHARTS Winter-Übersicht: Schneehöhe (cm) über Land
+WXCHARTS_SNOW_DEPTH_COLORS = [
+    '#6d5a7f',  # 0.5 - 2 cm
+    '#7f6894',  # 2 - 5 cm
+    '#9177aa',  # 5 - 10 cm
+    '#a385bf',  # 10 - 20 cm
+    '#b794d4',  # 20 - 35 cm
+    '#cc9fe6',  # 35 - 50 cm
+    '#dfaef0',  # 50 - 75 cm
+    '#eebdf5',  # 75 - 100 cm
+    '#f6d1f9',  # 100 - 150 cm
+    '#fce6fe',  # > 150 cm
+]
+WXCHARTS_SNOW_DEPTH_LEVELS = [0.5, 2, 5, 10, 20, 35, 50, 75, 100, 150, 200]
+WXCHARTS_SNOW_DEPTH_CMAP = mcolors.ListedColormap(WXCHARTS_SNOW_DEPTH_COLORS, name='wxcharts_snow_depth')
+WXCHARTS_SNOW_DEPTH_CMAP.set_over('#ffffff')
+
+# WXCHARTS Winter-Übersicht: Niederschlagsrate (mm/h) nach Niederschlagsart
+# Typ-Codes: 1 = Regen, 2 = Schnee, 3 = Eisregen, 4 = Eiskörner / Graupel
+WINTER_PRECIP_SPECS = [
+    {
+        'type_id': 1,
+        'label': 'Regen',
+        'levels': [0.1, 0.5, 1.0, 3.0, 6.0, 10.0, 20.0, 30.0],
+        'ticks': [0.1, 1.0, 3.0, 10.0, 30.0],
+        'colors': ['#607d9b', '#4d77a8', '#3874c4', '#2563eb', '#1d4ed8', '#1e40af', '#1e3a8a'],
+        'over': '#172554',
+    },
+    {
+        'type_id': 4,
+        'label': 'Eiskörner',
+        'levels': [0.1, 0.5, 1.0, 3.0, 6.0, 10.0],
+        'ticks': [0.1, 1.0, 3.0, 10.0],
+        'colors': ['#86efac', '#4ade80', '#22c55e', '#16a34a', '#15803d'],
+        'over': '#166534',
+    },
+    {
+        'type_id': 2,
+        'label': 'Schnee',
+        'levels': [0.1, 0.5, 1.0, 2.5, 5.0, 10.0],
+        'ticks': [0.1, 1.0, 5.0, 10.0],
+        'colors': ['#9ca3af', '#cbd5e1', '#e2e8f0', '#f1f5f9', '#ffffff'],
+        'over': '#ffffff',
+    },
+    {
+        'type_id': 3,
+        'label': 'Eisregen',
+        'levels': [0.1, 0.5, 1.0, 3.0, 6.0, 10.0],
+        'ticks': [0.1, 1.0, 3.0, 10.0],
+        'colors': ['#fdba74', '#fb923c', '#f97316', '#ea580c', '#dc2626'],
+        'over': '#991b1b',
+    },
+]
+
+# 1000-500 hPa Schichtdicke (gpdm)
+THICKNESS_LEVELS = [492, 498, 504, 510, 516, 522, 528, 534, 540, 546, 552, 558, 564, 570, 576]
+THICKNESS_COLOR_MAP = {
+    492: '#1d4ed8', 498: '#1d4ed8', 504: '#2563eb', 510: '#2563eb', 516: '#3b82f6',
+    522: '#06b6d4', 528: '#22d3ee',
+    534: '#22c55e', 540: '#4ade80', 546: '#4ade80',
+    552: '#eab308', 558: '#f59e0b', 564: '#f97316', 570: '#ef4444', 576: '#dc2626',
+}
+
+
 # ==============================================================================
 # 4. GRIB2 DOWNLOAD & PARSING (DWD ICON-EU & ECMWF IFS)
 # ==============================================================================
@@ -383,9 +448,65 @@ def _retrieve_ecmwf_chunk(source, date_str, time_hour, step, request_kwargs, tar
     return None
 
 
+def _safe_clean_array(arr, min_val=0.0, max_val=10000.0):
+    """Bereinigt GRIB-Missing-Values (z.B. 9999, 1e20), NaNs und Ausreißer."""
+    if arr is None:
+        return None
+    cleaned = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.where((cleaned < min_val) | (cleaned > max_val), 0.0, cleaned)
+
+
+def _classify_ecmwf_ptype(ptype_arr, precip_rate, t2m_c):
+    """Mappt ECMWF WMO Code Table 4.201 (ptype) auf 1=Regen, 2=Schnee, 3=Eisregen, 4=Eiskörner."""
+    if precip_rate is None:
+        return None
+    out = np.zeros(precip_rate.shape, dtype=np.uint8)
+    active = precip_rate >= 0.05
+    if ptype_arr is not None:
+        pt = np.rint(_safe_clean_array(ptype_arr, 0.0, 20.0)).astype(np.int32)
+        out[active & np.isin(pt, [1, 2, 11])] = 1
+        out[active & np.isin(pt, [5, 6])] = 2
+        out[active & np.isin(pt, [3, 12])] = 3
+        out[active & np.isin(pt, [7, 8, 9, 10])] = 4
+        # Fallback für aktive Randpixel ohne expliziten Typcode über 2m-Temperatur
+        unresolved = active & (out == 0)
+        if np.any(unresolved):
+            is_cold = (t2m_c <= 0.5) if t2m_c is not None else np.zeros_like(active, dtype=bool)
+            out[unresolved & is_cold] = 2
+            out[unresolved & (~is_cold)] = 1
+    else:
+        is_cold = (t2m_c <= 0.5) if t2m_c is not None else np.zeros_like(active, dtype=bool)
+        out[active & is_cold] = 2
+        out[active & (~is_cold)] = 1
+    return out
+
+
+def _classify_dwd_precip(rain_rate, snow_rate, ww_arr):
+    """Ermittelt Niederschlagsrate und -typ aus DWD ICON-EU Raten und WW-Code."""
+    if rain_rate is None and snow_rate is None:
+        return None, None
+    rr = rain_rate if rain_rate is not None else np.zeros_like(snow_rate)
+    sr = snow_rate if snow_rate is not None else np.zeros_like(rr)
+    total_rate = rr + sr
+
+    out = np.zeros(total_rate.shape, dtype=np.uint8)
+    active = total_rate >= 0.05
+    is_snow = sr > rr
+    out[active & (~is_snow)] = 1
+    out[active & is_snow] = 2
+
+    if ww_arr is not None:
+        ww = np.rint(_safe_clean_array(ww_arr, 0.0, 99.0)).astype(np.int32)
+        out[active & np.isin(ww, [56, 57, 66, 67])] = 3
+        out[active & np.isin(ww, [68, 69, 79, 83, 84, 87, 88, 89, 90, 96, 99])] = 4
+        out[active & np.isin(ww, [70, 71, 72, 73, 74, 75, 76, 77, 78, 85, 86])] = 2
+
+    return total_rate, out
+
+
 def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
     """
-    Lädt genau die 7 benötigten ECMWF IFS 0.25° Felder für einen Zeitschritt
+    Lädt alle benötigten ECMWF IFS 0.25° Felder (inkl. Winter-Übersicht) für einen Zeitschritt
     über Index/Byte-Range-Abruf in ein temporäres Verzeichnis und dekodiert sie.
     """
     if not (ECMWF_AVAILABLE and ECCODES_AVAILABLE) or ecmwf_run_date is None:
@@ -401,24 +522,35 @@ def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         chunks = [
-            ({"levtype": "sfc", "param": ["msl", "2t"]}, os.path.join(tmpdir, "sfc.grib2")),
-            ({"levtype": "pl", "levelist": 850, "param": "t"}, os.path.join(tmpdir, "pl850.grib2")),
-            ({"levtype": "pl", "levelist": 500, "param": "gh"}, os.path.join(tmpdir, "pl500.grib2")),
-            ({"levtype": "pl", "levelist": 300, "param": ["gh", "u", "v"]}, os.path.join(tmpdir, "pl300.grib2")),
+            ("core", lead_h, {"levtype": "sfc", "param": ["msl", "2t"]}, os.path.join(tmpdir, "sfc.grib2")),
+            ("core", lead_h, {"levtype": "pl", "levelist": 850, "param": "t"}, os.path.join(tmpdir, "pl850.grib2")),
+            ("core", lead_h, {"levtype": "pl", "levelist": [500, 1000], "param": "gh"}, os.path.join(tmpdir, "pl500_1000.grib2")),
+            ("core", lead_h, {"levtype": "pl", "levelist": 300, "param": ["gh", "u", "v"]}, os.path.join(tmpdir, "pl300.grib2")),
+            (
+                "winter",
+                lead_h,
+                {"levtype": "sfc", "param": ["sd", "rsn", "ptype"] + (["tp"] if lead_h > 0 else [])},
+                os.path.join(tmpdir, "winter_sfc.grib2")
+            ),
         ]
+        if lead_h > 3:
+            chunks.append(
+                ("tp_prev", lead_h - 3, {"levtype": "sfc", "param": "tp"}, os.path.join(tmpdir, "winter_tp_prev.grib2"))
+            )
 
-        grib_paths = []
-        with ThreadPoolExecutor(max_workers=4) as dl_exec:
-            futures = [
-                dl_exec.submit(_retrieve_ecmwf_chunk, source, date_str, time_hour, lead_h, req, path)
-                for req, path in chunks
-            ]
-            for fut in as_completed(futures):
+        grib_entries = []
+        with ThreadPoolExecutor(max_workers=6) as dl_exec:
+            future_map = {
+                dl_exec.submit(_retrieve_ecmwf_chunk, source, date_str, time_hour, step_req, req, path): tag
+                for tag, step_req, req, path in chunks
+            }
+            for fut in as_completed(future_map):
+                tag = future_map[fut]
                 res = fut.result()
                 if res and os.path.exists(res):
-                    grib_paths.append(res)
+                    grib_entries.append((tag, res))
 
-        for path in grib_paths:
+        for tag, path in grib_entries:
             with open(path, 'rb') as f:
                 while True:
                     msg_id = eccodes.codes_grib_new_from_file(f)
@@ -435,6 +567,11 @@ def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
                         if lats is None:
                             lats, lons = msg_lats, msg_lons
 
+                        if tag == "tp_prev":
+                            if short_name == 'tp':
+                                raw_fields['tp_prev'] = arr
+                            continue
+
                         if short_name == 'msl':
                             raw_fields['msl'] = arr
                         elif short_name in ('2t', 't2m'):
@@ -444,6 +581,9 @@ def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
                         elif short_name in ('gh', 'z') and level == 500:
                             divisor = 10.0 if short_name == 'gh' else 98.0665
                             raw_fields['fi500'] = arr / divisor
+                        elif short_name in ('gh', 'z') and level == 1000:
+                            divisor = 10.0 if short_name == 'gh' else 98.0665
+                            raw_fields['fi1000'] = arr / divisor
                         elif short_name in ('gh', 'z') and level == 300:
                             divisor = 10.0 if short_name == 'gh' else 98.0665
                             raw_fields['fi300'] = arr / divisor
@@ -451,6 +591,14 @@ def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
                             raw_fields['u300'] = arr
                         elif short_name == 'v' and level == 300:
                             raw_fields['v300'] = arr
+                        elif short_name == 'sd':
+                            raw_fields['sd'] = arr
+                        elif short_name == 'rsn':
+                            raw_fields['rsn'] = arr
+                        elif short_name == 'ptype':
+                            raw_fields['ptype'] = arr
+                        elif short_name == 'tp':
+                            raw_fields['tp'] = arr
                     finally:
                         eccodes.codes_release(msg_id)
 
@@ -460,33 +608,83 @@ def fetch_ecmwf_step_data(lead_h, ecmwf_run_date, source="ecmwf"):
     pmsl_hpa = (raw_fields['msl'] / 100.0) if 'msl' in raw_fields else None
     u300 = raw_fields.get('u300')
     v300 = raw_fields.get('v300')
+    t2m_c = (raw_fields['2t'] - 273.15) if '2t' in raw_fields else None
+    fi500 = raw_fields.get('fi500')
+    fi1000 = raw_fields.get('fi1000')
+    thickness = (fi500 - fi1000) if (fi500 is not None and fi1000 is not None) else None
+
+    snow_depth_cm = None
+    if 'sd' in raw_fields:
+        sd = _safe_clean_array(raw_fields['sd'], 0.0, 50.0)
+        if 'rsn' in raw_fields:
+            rsn = _safe_clean_array(raw_fields['rsn'], 10.0, 1000.0)
+            snow_depth_cm = np.where((sd > 0) & (rsn > 10.0), (sd * 100000.0) / rsn, np.where(sd > 0, sd * 1000.0, 0.0))
+        else:
+            snow_depth_cm = sd * 1000.0
+        snow_depth_cm = np.clip(snow_depth_cm, 0.0, 500.0)
+
+    precip_rate = None
+    if lead_h > 0 and 'tp' in raw_fields:
+        tp_curr = _safe_clean_array(raw_fields['tp'], 0.0, 20.0)
+        if lead_h == 3:
+            tp_prev = np.zeros_like(tp_curr)
+        elif 'tp_prev' in raw_fields:
+            tp_prev = _safe_clean_array(raw_fields['tp_prev'], 0.0, 20.0)
+        else:
+            tp_prev = None
+        if tp_prev is not None:
+            precip_rate = np.maximum(0.0, (tp_curr - tp_prev) * 1000.0) / 3.0
+
+    precip_type = _classify_ecmwf_ptype(raw_fields.get('ptype'), precip_rate, t2m_c)
 
     data = {
         't850': (raw_fields['t850'] - 273.15) if 't850' in raw_fields else None,
-        'fi500': raw_fields.get('fi500'),
+        'fi500': fi500,
         'fi300': raw_fields.get('fi300'),
         'pmsl': pmsl_hpa,
         'jet300': (np.sqrt(u300**2 + v300**2) * 3.6) if (u300 is not None and v300 is not None) else None,
-        't2m': (raw_fields['2t'] - 273.15) if '2t' in raw_fields else None,
+        't2m': t2m_c,
+        'thickness': thickness,
+        'snow_depth': snow_depth_cm,
+        'precip_rate': precip_rate,
+        'precip_type': precip_type,
     }
     return data, lats, lons
 
 
 def fetch_dwd_step_data(lead_h, date_str, run_str, base_url):
-    """Lädt und dekodiert alle benötigten DWD ICON-EU 0.0625° Felder für einen Zeitschritt."""
+    """Lädt und dekodiert alle benötigten DWD ICON-EU 0.0625° Felder (inkl. Winter-Übersicht) für einen Zeitschritt."""
     lead_str = f"{lead_h:03d}"
     url_map = {
         't850': f"{base_url}/t/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_850_T.grib2.bz2",
         'fi500': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_500_FI.grib2.bz2",
+        'fi1000': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_1000_FI.grib2.bz2",
         'fi300': f"{base_url}/fi/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_FI.grib2.bz2",
         'pmsl': f"{base_url}/pmsl/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_PMSL.grib2.bz2",
         'u300': f"{base_url}/u/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_U.grib2.bz2",
         'v300': f"{base_url}/v/icon-eu_europe_regular-lat-lon_pressure-level_{date_str}{run_str}_{lead_str}_300_V.grib2.bz2",
-        't2m': f"{base_url}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_T_2M.grib2.bz2"
+        't2m': f"{base_url}/t_2m/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_T_2M.grib2.bz2",
+        'h_snow': f"{base_url}/h_snow/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_H_SNOW.grib2.bz2",
     }
+    if lead_h > 0:
+        url_map.update({
+            'rain_gsp': f"{base_url}/rain_gsp/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_RAIN_GSP.grib2.bz2",
+            'rain_con': f"{base_url}/rain_con/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_RAIN_CON.grib2.bz2",
+            'snow_gsp': f"{base_url}/snow_gsp/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_SNOW_GSP.grib2.bz2",
+            'snow_con': f"{base_url}/snow_con/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_SNOW_CON.grib2.bz2",
+            'ww': f"{base_url}/ww/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{lead_str}_WW.grib2.bz2",
+        })
+    if lead_h > 3:
+        prev_str = f"{lead_h - 3:03d}"
+        url_map.update({
+            'prev_rain_gsp': f"{base_url}/rain_gsp/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{prev_str}_RAIN_GSP.grib2.bz2",
+            'prev_rain_con': f"{base_url}/rain_con/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{prev_str}_RAIN_CON.grib2.bz2",
+            'prev_snow_gsp': f"{base_url}/snow_gsp/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{prev_str}_SNOW_GSP.grib2.bz2",
+            'prev_snow_con': f"{base_url}/snow_con/icon-eu_europe_regular-lat-lon_single-level_{date_str}{run_str}_{prev_str}_SNOW_CON.grib2.bz2",
+        })
 
     raw_bytes = {}
-    with ThreadPoolExecutor(max_workers=7) as dl_exec:
+    with ThreadPoolExecutor(max_workers=10) as dl_exec:
         fut_map = {dl_exec.submit(fetch_dwd_file, url): key for key, url in url_map.items()}
         for fut in as_completed(fut_map):
             key = fut_map[fut]
@@ -494,23 +692,74 @@ def fetch_dwd_step_data(lead_h, date_str, run_str, base_url):
 
     t850_arr, lats, lons = parse_grib_array(raw_bytes.get('t850'))
     fi500_arr, _, _ = parse_grib_array(raw_bytes.get('fi500'))
+    fi1000_arr, _, _ = parse_grib_array(raw_bytes.get('fi1000'))
     fi300_arr, _, _ = parse_grib_array(raw_bytes.get('fi300'))
     pmsl_arr, _, _ = parse_grib_array(raw_bytes.get('pmsl'))
     u300_arr, _, _ = parse_grib_array(raw_bytes.get('u300'))
     v300_arr, _, _ = parse_grib_array(raw_bytes.get('v300'))
     t2m_arr, _, _ = parse_grib_array(raw_bytes.get('t2m'))
+    h_snow_arr, _, _ = parse_grib_array(raw_bytes.get('h_snow'))
 
     if lats is None or lons is None:
         return None, None, None
 
     pmsl_hpa = (pmsl_arr / 100.0) if pmsl_arr is not None else None
+    fi500 = (fi500_arr / 98.0665) if fi500_arr is not None else None
+    fi1000 = (fi1000_arr / 98.0665) if fi1000_arr is not None else None
+    thickness = (fi500 - fi1000) if (fi500 is not None and fi1000 is not None) else None
+    snow_depth_cm = (_safe_clean_array(h_snow_arr, 0.0, 50.0) * 100.0) if h_snow_arr is not None else None
+
+    precip_rate = None
+    precip_type = None
+    if lead_h > 0:
+        rain_gsp, _, _ = parse_grib_array(raw_bytes.get('rain_gsp'))
+        rain_con, _, _ = parse_grib_array(raw_bytes.get('rain_con'))
+        snow_gsp, _, _ = parse_grib_array(raw_bytes.get('snow_gsp'))
+        snow_con, _, _ = parse_grib_array(raw_bytes.get('snow_con'))
+        ww_arr, _, _ = parse_grib_array(raw_bytes.get('ww'))
+
+        if rain_gsp is not None or snow_gsp is not None:
+            shape_ref = rain_gsp if rain_gsp is not None else snow_gsp
+            rg = _safe_clean_array(rain_gsp, 0.0, 5000.0) if rain_gsp is not None else np.zeros_like(shape_ref)
+            rc = _safe_clean_array(rain_con, 0.0, 5000.0) if rain_con is not None else np.zeros_like(shape_ref)
+            sg = _safe_clean_array(snow_gsp, 0.0, 5000.0) if snow_gsp is not None else np.zeros_like(shape_ref)
+            sc = _safe_clean_array(snow_con, 0.0, 5000.0) if snow_con is not None else np.zeros_like(shape_ref)
+            rain_curr = rg + rc
+            snow_curr = sg + sc
+
+            if lead_h == 3:
+                rain_prev = np.zeros_like(rain_curr)
+                snow_prev = np.zeros_like(snow_curr)
+            else:
+                prg, _, _ = parse_grib_array(raw_bytes.get('prev_rain_gsp'))
+                prc, _, _ = parse_grib_array(raw_bytes.get('prev_rain_con'))
+                psg, _, _ = parse_grib_array(raw_bytes.get('prev_snow_gsp'))
+                psc, _, _ = parse_grib_array(raw_bytes.get('prev_snow_con'))
+                rain_prev = (
+                    (_safe_clean_array(prg, 0.0, 5000.0) if prg is not None else 0.0)
+                    + (_safe_clean_array(prc, 0.0, 5000.0) if prc is not None else 0.0)
+                ) if (prg is not None or prc is not None) else None
+                snow_prev = (
+                    (_safe_clean_array(psg, 0.0, 5000.0) if psg is not None else 0.0)
+                    + (_safe_clean_array(psc, 0.0, 5000.0) if psc is not None else 0.0)
+                ) if (psg is not None or psc is not None) else None
+
+            if rain_prev is not None and snow_prev is not None:
+                rain_rate = np.maximum(0.0, rain_curr - rain_prev) / 3.0
+                snow_rate = np.maximum(0.0, snow_curr - snow_prev) / 3.0
+                precip_rate, precip_type = _classify_dwd_precip(rain_rate, snow_rate, ww_arr)
+
     data = {
         't850': (t850_arr - 273.15) if t850_arr is not None else None,
-        'fi500': (fi500_arr / 98.0665) if fi500_arr is not None else None,
+        'fi500': fi500,
         'fi300': (fi300_arr / 98.0665) if fi300_arr is not None else None,
         'pmsl': pmsl_hpa,
         'jet300': (np.sqrt(u300_arr**2 + v300_arr**2) * 3.6) if (u300_arr is not None and v300_arr is not None) else None,
-        't2m': (t2m_arr - 273.15) if t2m_arr is not None else None
+        't2m': (t2m_arr - 273.15) if t2m_arr is not None else None,
+        'thickness': thickness,
+        'snow_depth': snow_depth_cm,
+        'precip_rate': precip_rate,
+        'precip_type': precip_type,
     }
     return data, lats, lons
 
@@ -631,12 +880,122 @@ DOMAIN_CONFIG = {
     }
 }
 
-PARAMS_ORDER = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind']
+PARAMS_ORDER = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind', 'winter_overview']
+
+
+def _render_winter_overview_fields(ax, lon_mesh, lat_mesh, data, transform=None):
+    """Rendert Schneehöhe (cm) und aktive Niederschlagsarten (mm/h) im WXCHARTS-Stil."""
+    cf_kwargs = {'transform': transform} if transform is not None else {}
+
+    snow_depth = data.get('snow_depth')
+    if snow_depth is not None and np.nanmax(snow_depth) >= 0.5:
+        masked_snow = np.ma.masked_less(snow_depth, 0.5)
+        ax.contourf(
+            lon_mesh, lat_mesh, masked_snow,
+            levels=WXCHARTS_SNOW_DEPTH_LEVELS,
+            cmap=WXCHARTS_SNOW_DEPTH_CMAP,
+            extend='max',
+            alpha=0.86,
+            zorder=2,
+            **cf_kwargs
+        )
+
+    precip_rate = data.get('precip_rate')
+    precip_type = data.get('precip_type')
+    if precip_rate is not None and precip_type is not None:
+        for p_spec in WINTER_PRECIP_SPECS:
+            type_mask = (precip_type == p_spec['type_id']) & (precip_rate >= 0.1)
+            if not np.any(type_mask):
+                continue
+            type_rate = np.where(type_mask, precip_rate, 0.0)
+            cmap = mcolors.ListedColormap(p_spec['colors'])
+            cmap.set_over(p_spec['over'])
+            ax.contourf(
+                lon_mesh, lat_mesh, type_rate,
+                levels=p_spec['levels'],
+                cmap=cmap,
+                extend='max',
+                alpha=0.92,
+                zorder=3,
+                **cf_kwargs
+            )
+
+
+def _render_winter_contours(ax, lon_mesh, lat_mesh, pmsl_smooth, thickness_smooth, transform=None):
+    """Rendert dezente Bodendruck-Isobaren und farbige 1000-500 hPa Schichtdickenlinien."""
+    c_kwargs = {'transform': transform} if transform is not None else {}
+
+    if pmsl_smooth is not None:
+        cs_pmsl = ax.contour(
+            lon_mesh, lat_mesh, pmsl_smooth,
+            levels=np.arange(960, 1056, 4),
+            colors='#cbd5e1', linewidths=0.85, alpha=0.58, zorder=5,
+            **c_kwargs
+        )
+        pmsl_labels = ax.clabel(
+            cs_pmsl, inline=True, fmt="%d",
+            fontsize=7.5, colors='#e2e8f0', inline_spacing=14
+        )
+        for lbl in pmsl_labels:
+            lbl.set_fontweight('semibold')
+            lbl.set_path_effects([pe.withStroke(linewidth=2.0, foreground='#000000')])
+
+    if thickness_smooth is not None:
+        thick_colors = [THICKNESS_COLOR_MAP[lvl] for lvl in THICKNESS_LEVELS]
+        thick_widths = [2.1 if lvl in (528, 546) else 1.25 for lvl in THICKNESS_LEVELS]
+        cs_thick = ax.contour(
+            lon_mesh, lat_mesh, thickness_smooth,
+            levels=THICKNESS_LEVELS,
+            colors=thick_colors, linewidths=thick_widths, alpha=0.95, zorder=6,
+            **c_kwargs
+        )
+        label_levels = [lvl for lvl in THICKNESS_LEVELS if lvl in (504, 510, 522, 528, 534, 546, 558, 570)]
+        thick_labels = ax.clabel(
+            cs_thick, levels=label_levels, inline=True, fmt="%d",
+            fontsize=9, inline_spacing=16
+        )
+        for lbl in thick_labels:
+            lbl.set_fontweight('bold')
+            lbl.set_path_effects([pe.withStroke(linewidth=2.8, foreground='#000000')])
+
+
+def _draw_winter_legend(fig):
+    """Zeichnet die 5-teilige WXCHARTS-Winter-Legende in der unteren Overlay-Leiste."""
+    cbar_bg = fig.add_axes([0.015, 0.014, 0.97, 0.060], facecolor='#0b0f19')
+    cbar_bg.patch.set_alpha(0.92)
+    cbar_bg.patch.set_edgecolor('#334155')
+    cbar_bg.patch.set_linewidth(0.8)
+    cbar_bg.set_xticks([])
+    cbar_bg.set_yticks([])
+
+    legend_items = [
+        (0.026, 0.200, "Schneehöhe (cm)", WXCHARTS_SNOW_DEPTH_COLORS, WXCHARTS_SNOW_DEPTH_LEVELS, [0.5, 5, 20, 50, 100, 200], '#ffffff'),
+        (0.244, 0.168, "Regen (mm/h)", WINTER_PRECIP_SPECS[0]['colors'], WINTER_PRECIP_SPECS[0]['levels'], WINTER_PRECIP_SPECS[0]['ticks'], WINTER_PRECIP_SPECS[0]['over']),
+        (0.430, 0.168, "Eiskörner (mm/h)", WINTER_PRECIP_SPECS[1]['colors'], WINTER_PRECIP_SPECS[1]['levels'], WINTER_PRECIP_SPECS[1]['ticks'], WINTER_PRECIP_SPECS[1]['over']),
+        (0.616, 0.168, "Eisregen (mm/h)", WINTER_PRECIP_SPECS[3]['colors'], WINTER_PRECIP_SPECS[3]['levels'], WINTER_PRECIP_SPECS[3]['ticks'], WINTER_PRECIP_SPECS[3]['over']),
+        (0.802, 0.168, "Schnee (mm/h)", WINTER_PRECIP_SPECS[2]['colors'], WINTER_PRECIP_SPECS[2]['levels'], WINTER_PRECIP_SPECS[2]['ticks'], WINTER_PRECIP_SPECS[2]['over']),
+    ]
+
+    for x0, width, title, colors, bounds, ticks, over_color in legend_items:
+        cmap = mcolors.ListedColormap(list(colors) + [over_color])
+        norm = mcolors.BoundaryNorm(bounds, ncolors=cmap.N, extend='max')
+        title_x = (x0 - 0.015) / 0.97
+        cbar_bg.text(
+            title_x, 0.78, title,
+            color='#e2e8f0', fontsize=7.6, fontweight='bold',
+            va='center', ha='left'
+        )
+        sub_ax = fig.add_axes([x0, 0.032, width, 0.013])
+        cb = mcolorbar.ColorbarBase(
+            sub_ax, cmap=cmap, norm=norm,
+            extend='max', ticks=ticks, orientation='horizontal', spacing='uniform'
+        )
+        cb.ax.tick_params(labelsize=7.0, colors='#cbd5e1', length=2, width=0.6, pad=1.5)
 
 
 def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
     """
-    Rendert alle 4 synoptischen Parameter für genau eine Domain ('europe' oder 'germany')
+    Rendert alle 5 synoptischen Parameter für genau eine Domain ('europe' oder 'germany')
     und einen Zeitschritt (1600x1000 WebP im WXCharts-Stil).
     """
     if data is None or lats is None or lons is None:
@@ -649,9 +1008,11 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
     pmsl_hpa = data.get('pmsl')
     lows, highs = find_pressure_extrema(pmsl_hpa, lats, lons, domain=dom)
 
-    # Auflösungsabhängig sanft vorgefiltertes PMSL für seidenweiche Isobaren
+    # Auflösungsabhängig sanft vorgefiltertes PMSL/Thickness für seidenweiche Konturen
     sigma_iso = max(0.8, 0.10 / dlon)
     pmsl_smooth = ndi.gaussian_filter(pmsl_hpa, sigma=sigma_iso) if (SCIPY_AVAILABLE and pmsl_hpa is not None) else pmsl_hpa
+    thickness_raw = data.get('thickness')
+    thickness_smooth = ndi.gaussian_filter(thickness_raw, sigma=sigma_iso) if (SCIPY_AVAILABLE and thickness_raw is not None) else thickness_raw
 
     lon_mesh, lat_mesh = np.meshgrid(lons, lats)
     cur_proj = ccrs.LambertConformal(**cfg['proj_kwargs']) if CARTOPY_AVAILABLE else None
@@ -706,6 +1067,14 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
             'cbar_ticks': np.arange(-40, 44, 4),
             'is_pmsl': True,
         },
+        'winter_overview': {
+            'field': data.get('snow_depth') if data.get('snow_depth') is not None else thickness_smooth,
+            'contour': pmsl_smooth,
+            'title': "Winter-Übersicht: Niederschlag, Schneehöhe (cm), Thickness (gpdm) & Isobaren",
+            'unit': "cm / mm/h",
+            'is_pmsl': True,
+            'is_winter': True,
+        },
     }
 
     init_str = format_german_date(run_date)
@@ -714,31 +1083,36 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
 
     for p in PARAMS_ORDER:
         spec = param_specs[p]
+        is_winter = spec.get('is_winter', False)
         field_val = spec['field']
-        if field_val is None:
+        if field_val is None and not (is_winter and (thickness_smooth is not None or pmsl_smooth is not None)):
             continue
         contour_val = spec['contour']
 
         fig = plt.figure(figsize=(16.0, 10.0), dpi=100, facecolor='#0b0f19')
+        cf = None
 
         if CARTOPY_AVAILABLE:
             ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], projection=cur_proj)
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
-            ax.set_facecolor('#0b1120')
+            ax.set_facecolor('#141923' if is_winter else '#0b1120')
 
             try:
-                ax.add_feature(cfeature.OCEAN, facecolor='#0b1120', zorder=0)
-                ax.add_feature(cfeature.LAND, facecolor='#111827', zorder=0)
+                ax.add_feature(cfeature.OCEAN, facecolor='#141923' if is_winter else '#0b1120', zorder=0)
+                ax.add_feature(cfeature.LAND, facecolor='#2a303c' if is_winter else '#111827', zorder=0)
             except Exception:
                 pass
 
-            cf = ax.contourf(
-                lon_mesh, lat_mesh, field_val,
-                levels=spec['levels'], cmap=spec['cmap'],
-                extend='both', transform=ccrs.PlateCarree(),
-                zorder=2
-            )
+            if is_winter:
+                _render_winter_overview_fields(ax, lon_mesh, lat_mesh, data, transform=ccrs.PlateCarree())
+            else:
+                cf = ax.contourf(
+                    lon_mesh, lat_mesh, field_val,
+                    levels=spec['levels'], cmap=spec['cmap'],
+                    extend='both', transform=ccrs.PlateCarree(),
+                    zorder=2
+                )
 
             try:
                 ax.add_feature(
@@ -780,7 +1154,9 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
             except Exception:
                 ax.coastlines(resolution='110m', color='#000000', linewidth=1.4, zorder=4)
 
-            if contour_val is not None:
+            if is_winter:
+                _render_winter_contours(ax, lon_mesh, lat_mesh, pmsl_smooth, thickness_smooth, transform=ccrs.PlateCarree())
+            elif contour_val is not None:
                 cs = ax.contour(
                     lon_mesh, lat_mesh, contour_val,
                     levels=spec['contour_levels'], colors='#ffffff',
@@ -807,7 +1183,7 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
                             lon_c, lat_c, f"T\n{p_val}",
                             transform=ccrs.PlateCarree(),
                             color='#ef4444', fontsize=11.5, fontweight='black',
-                            ha='center', va='center', zorder=6,
+                            ha='center', va='center', zorder=7,
                             path_effects=halo_stroke
                         )
 
@@ -818,18 +1194,22 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
                             lon_c, lat_c, f"H\n{p_val}",
                             transform=ccrs.PlateCarree(),
                             color='#38bdf8', fontsize=11.5, fontweight='black',
-                            ha='center', va='center', zorder=6,
+                            ha='center', va='center', zorder=7,
                             path_effects=halo_stroke
                         )
 
             ax.gridlines(draw_labels=False, linewidth=0.4, color='#ffffff', alpha=0.15, linestyle='--')
 
         else:
-            ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], facecolor='#0b0f19')
-            cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=spec['levels'], cmap=spec['cmap'], extend='both')
-            if contour_val is not None:
-                cs = ax.contour(lon_mesh, lat_mesh, contour_val, levels=spec['contour_levels'], colors='#ffffff', linewidths=1.1)
-                ax.clabel(cs, inline=True, fmt=spec['contour_fmt'], fontsize=9, colors='#ffffff')
+            ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], facecolor='#141923' if is_winter else '#0b0f19')
+            if is_winter:
+                _render_winter_overview_fields(ax, lon_mesh, lat_mesh, data, transform=None)
+                _render_winter_contours(ax, lon_mesh, lat_mesh, pmsl_smooth, thickness_smooth, transform=None)
+            else:
+                cf = ax.contourf(lon_mesh, lat_mesh, field_val, levels=spec['levels'], cmap=spec['cmap'], extend='both')
+                if contour_val is not None:
+                    cs = ax.contour(lon_mesh, lat_mesh, contour_val, levels=spec['contour_levels'], colors='#ffffff', linewidths=1.1)
+                    ax.clabel(cs, inline=True, fmt=spec['contour_fmt'], fontsize=9, colors='#ffffff')
 
         # WXCHARTS HEADER OVERLAY (OBEN LINKS; obere rechte Ecke bleibt frei für Web-Badge)
         header_text = (
@@ -852,23 +1232,26 @@ def render_domain_charts(dom, run_date, lead_h, data, lats, lons, output_base):
             zorder=10
         )
 
-        # WXCHARTS BOTTOM COLORBAR OVERLAY (UNTEN)
-        cbar_bg = fig.add_axes([0.02, 0.015, 0.96, 0.046], facecolor='#0b0f19')
-        cbar_bg.patch.set_alpha(0.90)
-        cbar_bg.patch.set_edgecolor('#334155')
-        cbar_bg.patch.set_linewidth(0.8)
-        cbar_bg.set_xticks([])
-        cbar_bg.set_yticks([])
+        # WXCHARTS BOTTOM COLORBAR / MULTI-LEGENDE OVERLAY (UNTEN)
+        if is_winter:
+            _draw_winter_legend(fig)
+        else:
+            cbar_bg = fig.add_axes([0.02, 0.015, 0.96, 0.046], facecolor='#0b0f19')
+            cbar_bg.patch.set_alpha(0.90)
+            cbar_bg.patch.set_edgecolor('#334155')
+            cbar_bg.patch.set_linewidth(0.8)
+            cbar_bg.set_xticks([])
+            cbar_bg.set_yticks([])
 
-        cbar_bg.text(
-            0.012, 0.5, f"({spec['unit']})",
-            color='#38bdf8', fontsize=8.5, fontweight='bold',
-            va='center', ha='left'
-        )
+            cbar_bg.text(
+                0.012, 0.5, f"({spec['unit']})",
+                color='#38bdf8', fontsize=8.5, fontweight='bold',
+                va='center', ha='left'
+            )
 
-        cbar_ax = fig.add_axes([0.062, 0.024, 0.900, 0.022])
-        cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal', ticks=spec['cbar_ticks'])
-        cbar.ax.tick_params(labelsize=8.5, colors='#ffffff', length=3, width=0.8)
+            cbar_ax = fig.add_axes([0.062, 0.024, 0.900, 0.022])
+            cbar = fig.colorbar(cf, cax=cbar_ax, orientation='horizontal', ticks=spec['cbar_ticks'])
+            cbar.ax.tick_params(labelsize=8.5, colors='#ffffff', length=3, width=0.8)
 
         filename = f"frame_{lead_h:03d}.webp"
         filepath = os.path.join(output_base, p, dom, filename)
