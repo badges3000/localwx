@@ -239,6 +239,7 @@ WXCHARTS_SNOW_DEPTH_COLORS = [
 ]
 WXCHARTS_SNOW_DEPTH_LEVELS = [0.5, 2, 5, 10, 20, 35, 50, 75, 100, 150, 200]
 WXCHARTS_SNOW_DEPTH_CMAP = mcolors.ListedColormap(WXCHARTS_SNOW_DEPTH_COLORS, name='wxcharts_snow_depth')
+WXCHARTS_SNOW_DEPTH_CMAP.set_under((0, 0, 0, 0))
 WXCHARTS_SNOW_DEPTH_CMAP.set_over('#ffffff')
 
 # WXCHARTS Winter-Übersicht: Niederschlagsrate (mm/h) nach Niederschlagsart
@@ -883,22 +884,34 @@ DOMAIN_CONFIG = {
 PARAMS_ORDER = ['t850_gp', 'z500_mslp', 'jet300', 't2m_wind', 'winter_overview']
 
 
+def _close_contour_grid(arr, threshold):
+    """Ersetzt Werte unterhalb der Schwelle (und Ränder) durch 0.0, um Polygon-Inversionen in Cartopy zu verhindern."""
+    out = np.where(np.isfinite(arr) & (arr >= threshold), arr, 0.0)
+    if out.shape[0] > 2 and out.shape[1] > 2:
+        out[0, :] = 0.0
+        out[-1, :] = 0.0
+        out[:, 0] = 0.0
+        out[:, -1] = 0.0
+    return out
+
+
 def _render_winter_overview_fields(ax, lon_mesh, lat_mesh, data, transform=None):
     """Rendert Schneehöhe (cm) und aktive Niederschlagsarten (mm/h) im WXCHARTS-Stil."""
-    cf_kwargs = {'transform': transform} if transform is not None else {}
+    cf_kwargs = {'transform': transform, 'transform_first': True} if transform is not None else {}
 
     snow_depth = data.get('snow_depth')
-    if snow_depth is not None and np.nanmax(snow_depth) >= 0.5:
-        masked_snow = np.ma.masked_less(snow_depth, 0.5)
-        ax.contourf(
-            lon_mesh, lat_mesh, masked_snow,
-            levels=WXCHARTS_SNOW_DEPTH_LEVELS,
-            cmap=WXCHARTS_SNOW_DEPTH_CMAP,
-            extend='max',
-            alpha=0.86,
-            zorder=2,
-            **cf_kwargs
-        )
+    if snow_depth is not None:
+        snow_clean = _close_contour_grid(snow_depth, 0.5)
+        if np.any(snow_clean >= 0.5):
+            ax.contourf(
+                lon_mesh, lat_mesh, snow_clean,
+                levels=WXCHARTS_SNOW_DEPTH_LEVELS,
+                cmap=WXCHARTS_SNOW_DEPTH_CMAP,
+                extend='max',
+                alpha=0.86,
+                zorder=2,
+                **cf_kwargs
+            )
 
     precip_rate = data.get('precip_rate')
     precip_type = data.get('precip_type')
@@ -907,8 +920,11 @@ def _render_winter_overview_fields(ax, lon_mesh, lat_mesh, data, transform=None)
             type_mask = (precip_type == p_spec['type_id']) & (precip_rate >= 0.1)
             if not np.any(type_mask):
                 continue
-            type_rate = np.where(type_mask, precip_rate, 0.0)
+            type_rate = _close_contour_grid(np.where(type_mask, precip_rate, 0.0), 0.1)
+            if not np.any(type_rate >= 0.1):
+                continue
             cmap = mcolors.ListedColormap(p_spec['colors'])
+            cmap.set_under((0, 0, 0, 0))
             cmap.set_over(p_spec['over'])
             ax.contourf(
                 lon_mesh, lat_mesh, type_rate,
